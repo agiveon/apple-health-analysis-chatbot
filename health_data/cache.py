@@ -75,9 +75,21 @@ def _process_record_type_worker(record_type, records, checkpoint_dir=None, use_d
         # Convert dates in batch using pandas
         if "startDate" in df.columns:
             df["startDate"] = pd.to_datetime(df["startDate"], errors='coerce')
+            # Remove timezone info if present to avoid timezone comparison issues
+            try:
+                if df["startDate"].dt.tz is not None:
+                    df["startDate"] = df["startDate"].dt.tz_localize(None)
+            except (AttributeError, TypeError):
+                pass  # Column might not be datetime64
         
         if "endDate" in df.columns:
             df["endDate"] = pd.to_datetime(df["endDate"], errors='coerce')
+            # Remove timezone info if present
+            try:
+                if df["endDate"].dt.tz is not None:
+                    df["endDate"] = df["endDate"].dt.tz_localize(None)
+            except (AttributeError, TypeError):
+                pass  # Column might not be datetime64
         
         # Convert value to numeric in batch
         if "value" in df.columns:
@@ -85,7 +97,11 @@ def _process_record_type_worker(record_type, records, checkpoint_dir=None, use_d
         
         # Add date column if we have startDate
         if "startDate" in df.columns:
+            # Ensure date column is Python date objects, not datetime64
             df["date"] = df["startDate"].dt.date
+            # Double-check: if somehow it's still datetime64, convert properly
+            if df["date"].dtype.name.startswith('datetime64'):
+                df["date"] = pd.to_datetime(df["startDate"]).dt.date
         
         # Sort by date if available
         if "date" in df.columns:
@@ -402,10 +418,27 @@ def parse_health_export(export_path, progress_callback=None, checkpoint_manager=
             if checkpoint_manager:
                 df = checkpoint_manager.load_dataframe(record_type)
                 if df is not None:
+                    # Normalize timezone-aware date columns to avoid comparison errors
+                    for col in ['date', 'startDate', 'endDate']:
+                        if col in df.columns:
+                            try:
+                                if df[col].dtype.name.startswith('datetime64'):
+                                    if df[col].dt.tz is not None:
+                                        df[col] = pd.to_datetime(df[col]).dt.tz_localize(None)
+                            except (AttributeError, TypeError):
+                                pass  # Column might not be datetime64 or might be date objects
                     cached_records[record_type] = df
                     # Try to load daily aggregation too
                     daily_df = checkpoint_manager.load_dataframe(record_type, is_daily=True)
                     if daily_df is not None:
+                        # Normalize daily aggregation date column too
+                        if 'date' in daily_df.columns:
+                            try:
+                                if daily_df['date'].dtype.name.startswith('datetime64'):
+                                    if daily_df['date'].dt.tz is not None:
+                                        daily_df['date'] = pd.to_datetime(daily_df['date']).dt.tz_localize(None)
+                            except (AttributeError, TypeError):
+                                pass
                         cached_records[f"{record_type}_daily"] = daily_df
         else:
             records_to_process.append((record_type, records))

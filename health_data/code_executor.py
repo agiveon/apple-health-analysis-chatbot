@@ -104,6 +104,24 @@ class CodeExecutor:
             
             def error(self, *args, **kwargs):
                 return st.error(*args, **kwargs)
+            
+            def dataframe(self, *args, **kwargs):
+                return st.dataframe(*args, **kwargs)
+            
+            def table(self, *args, **kwargs):
+                return st.table(*args, **kwargs)
+            
+            def json(self, *args, **kwargs):
+                return st.json(*args, **kwargs)
+            
+            def metric(self, *args, **kwargs):
+                return st.metric(*args, **kwargs)
+            
+            def columns(self, *args, **kwargs):
+                return st.columns(*args, **kwargs)
+            
+            def container(self, *args, **kwargs):
+                return st.container(*args, **kwargs)
         
         custom_st = CustomStreamlit(self, capture_figures)
         

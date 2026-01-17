@@ -8,7 +8,7 @@ from collections import defaultdict
 def build_conversation_context(conversation_history: List[Dict[str, Any]]) -> str:
     """
     Build conversation context from history.
-    IMPORTANT: Only include user requests and text responses, NOT code, to avoid hardcoding patterns.
+    Includes user requests, text responses, and code for reference when answering follow-up questions.
     
     Args:
         conversation_history: List of message dictionaries
@@ -19,25 +19,36 @@ def build_conversation_context(conversation_history: List[Dict[str, Any]]) -> st
     if not conversation_history:
         return ""
     
-    context = "\n\nPREVIOUS CONVERSATION (for context only - do NOT reuse code patterns):\n"
+    context = "\n\nPREVIOUS CONVERSATION:\n"
     for msg in conversation_history[-5:]:  # Last 5 messages
         role = msg.get("role", "user")
         content = msg.get("content", "")
         msg_type = msg.get("type", "")
+        code = msg.get("code", "")
         
         if role == "user":
             context += f"User: {content}\n"
         else:
-            # Only include text responses, NOT code - to prevent hardcoding patterns
             if msg_type == "text":
                 context += f"Assistant: {content}\n"
             elif msg_type == "error":
                 # Include errors for context
                 error_preview = content[:200] + "..." if len(content) > 200 else content
                 context += f"Assistant: [Error occurred: {error_preview}]\n"
-            else:
-                # For plots/code, just indicate that a visualization was created, but don't include the code
+                # Include code if available (for debugging context)
+                if code:
+                    code_preview = code[:500] + "..." if len(code) > 500 else code
+                    context += f"  Code that caused error:\n{code_preview}\n"
+            elif msg_type == "plot":
+                # Include code for reference when user asks follow-up questions
                 context += f"Assistant: [Created a visualization based on user request]\n"
+                if code:
+                    context += f"  Code used:\n```python\n{code}\n```\n"
+            else:
+                # For other types, include what we can
+                context += f"Assistant: {content}\n"
+                if code:
+                    context += f"  Code used:\n```python\n{code}\n```\n"
     
     return context
 
@@ -166,23 +177,42 @@ COMMON DATA TYPES YOU MIGHT FIND:
 - Workouts: `raw_records['HKWorkoutTypeIdentifier']` or `workout_*`
 - Many others - check the DATA STRUCTURE DETAILS section above for what's available
 
-CRITICAL DATE HANDLING RULES:
-1. The `date` columns contain Python `datetime.date` objects, NOT pandas Timestamps
-2. When filtering by date, convert date strings to date objects: `pd.to_datetime('2024-01-01').date()`
-3. When comparing dates, use: `df[df['date'] >= pd.to_datetime('2024-01-01').date()]`
-4. To convert date column for plotting: `pd.to_datetime(df['date'])` converts dates to timestamps for matplotlib
-5. NEVER directly compare Timestamp with date - always convert one to match the other
-6. For date arithmetic: `from datetime import timedelta` then `df['date'] >= (datetime.now().date() - timedelta(days=30))`
+CRITICAL DATE HANDLING RULES (MUST FOLLOW TO AVOID TypeError):
+1. The `date` columns may be Python `date` objects OR pandas `datetime64` (timezone-aware or timezone-naive)
+2. ALWAYS normalize dates before comparison to avoid "Invalid comparison between dtype=datetime64[ns, UTC-X] and Timestamp" errors
+3. SAFE PATTERN for date filtering (ALWAYS use this pattern):
+   ```python
+   # Step 1: Normalize the date column to timezone-naive datetime64
+   df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+   
+   # Step 2: Create cutoff date as timezone-naive Timestamp
+   cutoff_date = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=180)
+   
+   # Step 3: Filter
+   df_filtered = df[df['date'] >= cutoff_date]
+   ```
+4. For "past X months" queries, ALWAYS use this pattern:
+   ```python
+   # Normalize date column first
+   df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)
+   # Calculate cutoff
+   cutoff = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=X*30)
+   # Filter
+   df_filtered = df[df['date'] >= cutoff]
+   ```
+5. To check if date column is timezone-aware: `str(df['date'].dtype)` contains 'UTC' if timezone-aware
+6. NEVER compare timezone-aware datetime64 with timezone-naive Timestamp - normalize first!
+7. For plotting: After filtering, convert for plotting: `pd.to_datetime(df_filtered['date'])` if needed
 
 USER REQUEST:
 {user_query}
 
 IMPORTANT CONTEXT:
-- Each request should be handled INDEPENDENTLY based on what the user asks for RIGHT NOW.
-- Do NOT reuse code patterns, window sizes, or visualization styles from previous requests unless the user explicitly asks to modify a previous visualization.
+- When the user asks a NEW question, handle it independently based on what they ask for RIGHT NOW.
+- When the user asks FOLLOW-UP questions about a previous visualization (e.g., "why did you use X?", "can you change Y?", "what does Z mean?"), reference the previous code from the conversation history to answer their question or make the requested modification.
 - Do NOT add features the user didn't ask for unless explicitly requested.
-- If the user asks to modify a previous visualization, you may reference the previous approach, but still generate fresh code based on the current request.
-- For NEW requests, generate code from scratch based on the user's current question, NOT based on previous code patterns.
+- If the user asks to modify a previous visualization, reference the previous code and modify it based on their request.
+- For NEW requests (not follow-ups), generate code from scratch based on the user's current question.
 - Generate ONLY what the user explicitly requests - nothing more, nothing less.
 
 INSTRUCTIONS:
@@ -212,12 +242,15 @@ For VISUALIZATIONS (when generating code):
 10. Do NOT import modules (they're already imported, but you can use `from datetime import date, timedelta, datetime`)
 11. File I/O is ONLY allowed for saving plots to `output_dir` using `fig.savefig()`
 12. Focus on creating clear, informative visualizations that match EXACTLY what the user requested
-12. CRITICAL: Date comparison rules:
-    - The 'date' column in DataFrames is typically datetime64[us] (pandas Timestamp)
-    - NEVER compare datetime64 columns directly with Python `date` objects
-    - To filter by date, convert the comparison date to pandas Timestamp first
-    - When calculating relative dates, use: `pd.Timestamp.now() - pd.Timedelta(days=X)` or convert to Timestamp
-    - To convert date column for plotting, use: `pd.to_datetime(df['date'])` to convert dates to timestamps for matplotlib
+12. CRITICAL: Date comparison rules (MUST FOLLOW TO AVOID ERRORS):
+    - The 'date' column may be datetime64 (timezone-aware or timezone-naive) or Python date objects
+    - ALWAYS normalize timezone-aware columns before comparison: `df['date'] = pd.to_datetime(df['date']).dt.tz_localize(None)`
+    - For date filtering, ensure both sides are timezone-naive:
+      * `cutoff = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=180)`
+      * `df_filtered = df[pd.to_datetime(df['date']).dt.tz_localize(None) >= cutoff]`
+    - NEVER compare timezone-aware datetime64 with timezone-naive Timestamp - normalize first!
+    - For "past X months" queries: `cutoff = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=X*30)`
+    - Check if timezone-aware: `df['date'].dtype` shows `datetime64[ns, UTC-X]` if timezone-aware
 
 OUTPUT FORMAT:
 - If providing a text answer: Start your response with "TEXT_RESPONSE:" followed by your answer
