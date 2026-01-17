@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Cache and data (user-specific, should not be committed)
+cache/
+*.pkl
+*.pickle
+checkpoints/
+conversations/
+
+# Output files (user-specific)
+output/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Apple Health exports (user-specific data)
+*.zip
+apple_health_export/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (user-specific)
+config.json
+
+# Logs
+*.log
+

@@ -1,0 +1,28 @@
+{
+  "paths": {
+    "export_path": "",
+    "cache_dir": "",
+    "cache_filename": "all_health_data.pkl",
+    "zip_path": "",
+    "cache_path": "",
+    "output_dir": ""
+  },
+  "claude": {
+    "model": "claude-opus-4-5",
+    "model_alternatives": [
+      "claude-opus-4-5",
+      "claude-3-5-sonnet-20241022",
+      "claude-3-5-sonnet-20240620",
+      "claude-3-5-sonnet",
+      "claude-sonnet-4-20250514",
+      "claude-3-opus-20240229",
+      "claude-3-sonnet-20240229"
+    ],
+    "max_tokens": 4096
+  },
+  "dashboard": {
+    "page_title": "Health Data Analysis Dashboard",
+    "page_icon": "🏥",
+    "layout": "wide"
+  }
+}
