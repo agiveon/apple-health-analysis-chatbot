@@ -252,6 +252,30 @@ For VISUALIZATIONS (when generating code):
     - For "past X months" queries: `cutoff = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(days=X*30)`
     - Check if timezone-aware: `df['date'].dtype` shows `datetime64[ns, UTC-X]` if timezone-aware
 
+13. CRITICAL: Pandas Data Type Rules (MUST FOLLOW TO AVOID AttributeError):
+    - ALWAYS check what data type you're working with: `df['column'].dtype` or `type(df['column'].iloc[0])`
+    - Datetime columns support: `.dt.day_name()`, `.dt.dayofweek`, `.dt.month`, `.dt.year`, `.dt.date`, `.dt.to_period()`, etc.
+    - Period columns (created with `.dt.to_period()`) are DIFFERENT from Datetime:
+      * Period objects have LIMITED methods - they do NOT support `.dt.day_name()`, `.dt.dayofweek`, `.dt.month`, etc.
+      * Period objects support: `.dt.start_time`, `.dt.end_time`, `.dt.to_timestamp()`
+      * If you need datetime methods, convert Period back: `df['period_col'].dt.to_timestamp()` or keep as datetime
+    - To get unique days without converting to Period: `df['date'].dt.normalize().drop_duplicates()` or `df['date'].dt.date.drop_duplicates()`
+    - NEVER call datetime accessor methods (`.dt.day_name()`, `.dt.month`, etc.) on Period columns - convert to datetime first
+    - When in doubt, keep columns as datetime64 and avoid `.to_period()` unless specifically needed for period-based operations
+    - Common mistake: `df['date'].dt.to_period('D').dt.day_name()` - this FAILS because Period doesn't have day_name()
+    - Correct approach: `df['date'].dt.day_name()` (keep as datetime) OR `df['date'].dt.to_period('D').dt.to_timestamp().dt.day_name()` (convert back)
+    - For grouping by day of week: `df.groupby(df['date'].dt.day_name())` - no need to convert to Period
+    - For getting unique dates: `df['date'].drop_duplicates()` or `df['date'].dt.date.drop_duplicates()` - no need for Period
+
+14. GENERAL PANDAS BEST PRACTICES:
+    - Always verify column exists: `if 'column_name' in df.columns:`
+    - Check for empty dataframes: `if len(df) == 0: return` or handle gracefully
+    - Use `.copy()` when modifying filtered dataframes to avoid SettingWithCopyWarning
+    - For aggregations, prefer `.groupby()` over manual loops
+    - When extracting datetime components, use `.dt` accessor on datetime columns, not on Period columns
+    - Test your logic step-by-step: if you convert to Period, verify what methods are available before using them
+    - If you need both period operations AND datetime methods, keep the original datetime column and create a separate period column
+
 OUTPUT FORMAT:
 - If providing a text answer: Start your response with "TEXT_RESPONSE:" followed by your answer
 - If generating code: Start your response with "CODE:" followed by the Python code (no markdown, no explanations)
