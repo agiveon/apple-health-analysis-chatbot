@@ -3,6 +3,7 @@ pandas
 numpy
 matplotlib
 anthropic
+openai
 python-dotenv
 lxml
 duckdb

@@ -20,6 +20,16 @@
     ],
     "max_tokens": 4096
   },
+  "openai": {
+    "model": "gpt-4o",
+    "model_alternatives": [
+      "gpt-4o",
+      "gpt-4-turbo",
+      "gpt-4",
+      "gpt-3.5-turbo"
+    ],
+    "max_tokens": 4096
+  },
   "dashboard": {
     "page_title": "Health Data Analysis Dashboard",
     "page_icon": "🏥",

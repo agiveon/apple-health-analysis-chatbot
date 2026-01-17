@@ -51,6 +51,16 @@ class Config:
                 ],
                 "max_tokens": 4096
             },
+            "openai": {
+                "model": "gpt-4o",
+                "model_alternatives": [
+                    "gpt-4o",
+                    "gpt-4-turbo",
+                    "gpt-4",
+                    "gpt-3.5-turbo"
+                ],
+                "max_tokens": 4096
+            },
             "dashboard": {
                 "page_title": "Health Data Analysis Dashboard",
                 "page_icon": "🏥",
@@ -73,6 +83,9 @@ class Config:
         # Apply environment variable overrides
         if os.getenv("CLAUDE_MODEL"):
             config["claude"]["model"] = os.getenv("CLAUDE_MODEL")
+        
+        if os.getenv("OPENAI_MODEL"):
+            config["openai"]["model"] = os.getenv("OPENAI_MODEL")
         
         if os.getenv("EXPORT_PATH"):
             config["paths"]["export_path"] = os.getenv("EXPORT_PATH")
@@ -162,6 +175,21 @@ class Config:
     def claude_max_tokens(self) -> int:
         """Get Claude max tokens"""
         return self.get("claude.max_tokens", 4096)
+    
+    @property
+    def openai_model(self) -> str:
+        """Get OpenAI model"""
+        return self.get("openai.model", "gpt-4o")
+    
+    @property
+    def openai_model_alternatives(self) -> list:
+        """Get OpenAI model alternatives"""
+        return self.get("openai.model_alternatives", [])
+    
+    @property
+    def openai_max_tokens(self) -> int:
+        """Get OpenAI max tokens"""
+        return self.get("openai.max_tokens", 4096)
     
     @property
     def dashboard_title(self) -> str:

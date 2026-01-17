@@ -12,7 +12,7 @@
 
 ---
 
-Interactive Streamlit dashboard for analyzing Apple Health export data using natural language queries powered by Claude AI. Ask questions about any health data in your export and get instant visualizations or text answers.
+Interactive Streamlit dashboard for analyzing Apple Health export data using natural language queries powered by Claude AI or OpenAI. Ask questions about any health data in your export and get instant visualizations or text answers.
 
 **Key Features:**
 - Zero configuration required - just point to your zip file
@@ -23,7 +23,7 @@ Interactive Streamlit dashboard for analyzing Apple Health export data using nat
 
 ## Features
 
-- 🤖 **AI-Powered Analysis**: Natural language queries powered by Claude AI
+- 🤖 **AI-Powered Analysis**: Natural language queries powered by Claude AI or OpenAI
 - 📊 **Interactive Visualizations**: Generate plots and charts on the fly
 - 💬 **Chat Interface**: Conversational interface for asking questions about your health data
 - 📁 **All Health Data**: Supports all data types from Apple Health exports
@@ -40,10 +40,14 @@ pip install -r requirements.txt
 
 ### 2. Configure API Key
 
-Create a `.env` file in the project root with your Anthropic API key:
+Create a `.env` file in the project root with either your Anthropic or OpenAI API key (or both - Anthropic will be preferred if both are present):
 
 ```
-ANTHROPIC_API_KEY=your_api_key_here
+# Option 1: Use Anthropic Claude
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
+
+# Option 2: Use OpenAI
+OPENAI_API_KEY=your_openai_api_key_here
 ```
 
 ### 3. Export Your Health Data
@@ -175,8 +179,9 @@ The dashboard supports **all** data types from Apple Health exports, including:
 - If you move the zip file, you'll need to select it again
 
 **API errors:**
-- Verify your `ANTHROPIC_API_KEY` is set in `.env`
+- Verify either `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set in `.env`
 - Check that the model name in `config.json` is valid (if you've customized it)
+- If both API keys are present, Anthropic will be used by default
 
 **Import errors:**
 - Make sure all dependencies are installed: `pip install -r requirements.txt`
@@ -186,12 +191,14 @@ The dashboard supports **all** data types from Apple Health exports, including:
 
 By default, the app works with zero configuration. However, you can customize settings by creating a `config.json` file (copy from `config.json.example`):
 
-- **Claude Model**: Which AI model to use (default: `claude-opus-4-5`)
+- **Claude Model**: Which Claude model to use (default: `claude-opus-4-5`)
+- **OpenAI Model**: Which OpenAI model to use (default: `gpt-4o`)
 - **Dashboard Settings**: Title, icon, layout
 
-You can also override the Claude model via environment variable:
+You can also override models via environment variables:
 ```bash
 export CLAUDE_MODEL=claude-3-5-sonnet-20240620
+export OPENAI_MODEL=gpt-4-turbo
 ```
 
 ## License

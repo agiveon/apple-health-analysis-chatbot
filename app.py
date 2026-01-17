@@ -14,7 +14,7 @@ load_dotenv()
 
 from health_data.config import Config
 from health_data.cache import load_all_health_data, get_data_summary
-from health_data.claude_client import ClaudeClient
+from health_data.ai_client import get_ai_client
 from health_data.code_executor import CodeExecutor
 from health_data.prompts import build_analysis_prompt, get_data_structure_info, build_conversation_context
 from health_data.zip_handler import extract_health_export, get_zip_directory
@@ -510,16 +510,12 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                     conversation_context
                 )
                 
-                # Initialize Claude client
+                # Initialize AI client (Claude or OpenAI based on available API key)
                 config = Config()
-                claude_client = ClaudeClient(
-                    model=config.claude_model,
-                    model_alternatives=config.claude_model_alternatives,
-                    max_tokens=config.claude_max_tokens
-                )
+                ai_client = get_ai_client(config)
                 
                 # Generate response
-                response = claude_client.generate_response(full_prompt)
+                response = ai_client.generate_response(full_prompt)
                 
                 if response["type"] == "text":
                     st.write(response["content"])
