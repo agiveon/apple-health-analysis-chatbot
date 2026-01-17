@@ -1,5 +1,17 @@
 # Health Data Analysis Dashboard
 
+<div align="center">
+
+![Example Visualization](images/steps-visualization.png)
+
+**Ask questions about your health data and get instant visualizations**
+
+*Example: "Show me the number of steps per day in the last 3 months as a dot plot. Add a 7 day average window line through"*
+
+</div>
+
+---
+
 Interactive Streamlit dashboard for analyzing Apple Health export data using natural language queries powered by Claude AI. Ask questions about any health data in your export and get instant visualizations or text answers.
 
 **Key Features:**
@@ -35,6 +47,14 @@ ANTHROPIC_API_KEY=your_api_key_here
 ```
 
 ### 3. Export Your Health Data
+
+<div align="center">
+
+![Export Health Data](images/export-health-data.png)
+
+*Navigate to Settings → Privacy & Security → Health → Export Health Data*
+
+</div>
 
 1. On your iPhone, go to **Settings** → **Privacy & Security** → **Health** → **Export Health Data**
 2. Save the zip file to a folder on your computer

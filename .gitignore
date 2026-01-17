@@ -44,13 +44,6 @@ cache/
 checkpoints/
 conversations/
 
-# Output files (user-specific)
-output/
-*.png
-*.jpg
-*.jpeg
-*.pdf
-
 # Apple Health exports (user-specific data)
 *.zip
 apple_health_export/
