@@ -9,7 +9,7 @@ from openai import OpenAI
 class OpenAIClient:
     """Client for interacting with OpenAI API"""
     
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o", 
+    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-5.1-chat-latest", 
                  model_alternatives: Optional[List[str]] = None, max_tokens: int = 4096):
         """
         Initialize OpenAI client.
@@ -27,6 +27,7 @@ class OpenAIClient:
         self.client = OpenAI(api_key=self.api_key)
         self.model = model
         self.model_alternatives = model_alternatives or [
+            "gpt-5.1-chat-latest",
             "gpt-4o",
             "gpt-4-turbo",
             "gpt-4",

@@ -284,3 +284,75 @@ Remember: Start with "TEXT_RESPONSE:" for text answers or "CODE:" for visualizat
     
     return prompt
 
+
+def build_error_recovery_prompt(original_query: str, failed_code: str, error_message: str,
+                                data_summary: str, data_structure_info: str,
+                                conversation_context: str = "") -> str:
+    """
+    Build a prompt for error recovery - asking the LLM to fix the code.
+    
+    Args:
+        original_query: The original user query
+        failed_code: The code that failed to execute
+        error_message: The error message from execution
+        data_summary: Summary of available data
+        data_structure_info: Detailed data structure information
+        conversation_context: Conversation history context
+        
+    Returns:
+        Complete error recovery prompt string
+    """
+    prompt = f"""You previously generated code that failed to execute. Please fix the code and try again.
+
+ORIGINAL USER REQUEST:
+{original_query}
+
+FAILED CODE:
+```python
+{failed_code}
+```
+
+ERROR MESSAGE:
+{error_message}
+
+DATA SUMMARY:
+{data_summary}
+
+DATA STRUCTURE DETAILS:
+{data_structure_info}
+{conversation_context}
+
+AVAILABLE VARIABLES:
+- `raw_records`: Dictionary of all DataFrames, keyed by record type
+- Individual DataFrames are also available as variables with sanitized names
+- `available_types`: List of all available record type names
+- `metadata`: Dictionary with metadata about each record type
+- `output_dir`: Directory path where output files can be saved (if available)
+- `pd`: pandas module
+- `np`: numpy module
+- `plt`: matplotlib.pyplot module
+- `st`: streamlit module (for displaying results)
+- `timestamp`: Pre-defined timestamp string for file naming
+
+CRITICAL: Analyze the error carefully:
+1. Check if you're accessing columns that don't exist
+2. Verify data types match what you expect (check with `df['column'].dtype`)
+3. Ensure you're not mixing incompatible types (e.g., dividing Series by dict, Period vs Datetime)
+4. Check if dataframes are empty before operations
+5. Verify variable names match what's actually available
+6. Review the error message - it tells you exactly what went wrong
+
+INSTRUCTIONS:
+- Fix the code based on the error message
+- Generate corrected Python code that addresses the specific error
+- Keep the same overall approach unless the error indicates a fundamental issue
+- Test your logic: if dividing, ensure both sides are numeric; if accessing columns, verify they exist
+- Generate ONLY the corrected code - start with "CODE:" followed by the fixed Python code
+
+OUTPUT FORMAT:
+- Start your response with "CODE:" followed by the corrected Python code (no markdown, no explanations)
+- The code should be complete and executable
+- Address the specific error mentioned above"""
+    
+    return prompt
+

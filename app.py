@@ -16,7 +16,7 @@ from health_data.config import Config
 from health_data.cache import load_all_health_data, get_data_summary
 from health_data.ai_client import get_ai_client
 from health_data.code_executor import CodeExecutor
-from health_data.prompts import build_analysis_prompt, get_data_structure_info, build_conversation_context
+from health_data.prompts import build_analysis_prompt, get_data_structure_info, build_conversation_context, build_error_recovery_prompt
 from health_data.zip_handler import extract_health_export, get_zip_directory
 from health_data.checkpoint import CheckpointManager
 
@@ -475,6 +475,9 @@ for message in st.session_state.messages:
 
 # Chat input
 if prompt := st.chat_input("Ask a question about your health data..."):
+    # Reset error retry count for new query
+    st.session_state['error_retry_count'] = 0
+    
     # If this is the first message in a new conversation, we'll create it after getting response
     # Add user message to history
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -560,145 +563,223 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                         print(f"[App] Full code:\n{code}", file=sys.__stderr__)
                         print(f"[App] ====================================", file=sys.__stderr__)
                         
-                        # Show error FIRST - make it VERY visible
-                        st.error(f"❌ Error executing code:\n```\n{error_msg}\n```")
+                        # Check if we should retry (limit to 1 retry to avoid infinite loops)
+                        retry_count = st.session_state.get('error_retry_count', 0)
+                        max_retries = 1
+                        error_handled = False  # Initialize flag
                         
-                        # Store error state for debug panel OUTSIDE chat message
-                        st.session_state['last_error'] = {
-                            'error_msg': error_msg,
-                            'code': code,
-                            'executor_debug_info': executor_debug_info,
-                            'data_dict_keys': list(data_dict.keys())[:30]
-                        }
-                        
-                        # Additional details in expander
-                        with st.expander("📋 Additional Debug Details", expanded=False):
-                            st.markdown("### 📋 Full Generated Code")
-                            st.code(code, language="python")
+                        if retry_count < max_retries:
+                            # Show that we're retrying
+                            st.warning(f"⚠️ Error detected. Attempting to fix and retry... (attempt {retry_count + 1}/{max_retries + 1})")
                             
-                            st.markdown("---")
-                            st.markdown("### 🔍 Error Details")
-                            st.code(error_msg, language="python")
+                            # Build error recovery prompt
+                            recovery_prompt = build_error_recovery_prompt(
+                                original_query=prompt,
+                                failed_code=code,
+                                error_message=error_msg,
+                                data_summary=summary_str,
+                                data_structure_info=data_structure,
+                                conversation_context=build_conversation_context(st.session_state.messages)
+                            )
                             
-                            st.markdown("---")
-                            st.markdown("### 📦 Data Dictionary Contents")
-                            st.write("**Keys in data_dict:**")
-                            st.write(list(data_dict.keys())[:30])
-                            st.write(f"**Total keys: {len(data_dict)}**")
+                            # Generate fixed code
+                            recovery_response = ai_client.generate_response(recovery_prompt)
                             
-                            st.write("**output_dir in data_dict:**")
-                            st.write(f"- Present: {'output_dir' in data_dict}")
-                            if 'output_dir' in data_dict:
-                                st.write(f"- Value: `{data_dict['output_dir']}`")
-                                st.write(f"- Exists: {os.path.exists(data_dict['output_dir']) if data_dict['output_dir'] else False}")
-                            
-                            st.write("**timestamp in data_dict:**")
-                            st.write(f"- Present: {'timestamp' in data_dict}")
-                            if 'timestamp' in data_dict:
-                                st.write(f"- Value: `{data_dict['timestamp']}`")
-                            
-                            st.markdown("---")
-                            st.markdown("### 🔎 Code Analysis")
-                            
-                            # Find all timestamp usage
-                            lines = code.split('\n')
-                            timestamp_lines = []
-                            for i, line in enumerate(lines, 1):
-                                if 'timestamp' in line:
-                                    timestamp_lines.append((i, line.strip()))
-                            
-                            if timestamp_lines:
-                                st.write("**Lines containing 'timestamp':**")
-                                for line_num, line_content in timestamp_lines:
-                                    st.code(f"Line {line_num}: {line_content}", language="python")
-                            else:
-                                st.warning("⚠️ No lines found containing 'timestamp'")
-                            
-                            st.markdown("---")
-                            st.markdown("### 🗂️ Execution Environment")
-                            
-                            # Try to get what would be in safe_globals
-                            st.write("**Expected variables in execution context:**")
-                            expected_vars = [
-                                'timestamp', 'output_dir', 'pd', 'np', 'plt', 'st', 
-                                'date', 'timedelta', 'datetime', 'os'
-                            ]
-                            for var in expected_vars:
-                                if var in data_dict:
-                                    st.write(f"- ✓ `{var}`: Present in data_dict")
-                                elif var == 'timestamp':
-                                    st.write(f"- ✗ `{var}`: **MISSING** (should be added by CodeExecutor)")
-                                elif var == 'output_dir':
-                                    st.write(f"- {'✓' if 'output_dir' in data_dict else '✗'} `{var}`: {'Present' if 'output_dir' in data_dict else 'MISSING'}")
+                            if recovery_response["type"] == "code":
+                                fixed_code = recovery_response["content"]
+                                
+                                # Try executing the fixed code
+                                st.info("🔄 Executing fixed code...")
+                                executor_retry = CodeExecutor(data_dict)
+                                output_retry, errors_retry, error_msg_retry, captured_figures_retry = executor_retry.execute(
+                                    fixed_code,
+                                    capture_figures=True
+                                )
+                                
+                                if error_msg_retry:
+                                    # Still failed after retry - show error
+                                    st.error(f"❌ Error still occurred after retry:\n```\n{error_msg_retry}\n```")
+                                    st.session_state['error_retry_count'] = retry_count + 1
+                                    error_handled = False
                                 else:
-                                    st.write(f"- ✓ `{var}`: Should be available (built-in/module)")
-                            
-                            st.markdown("---")
-                            st.markdown("### 📊 Raw Records Available")
-                            if 'raw_records' in data_dict:
-                                st.write(f"**Number of record types: {len(data_dict['raw_records'])}**")
-                                st.write("**First 10 record types:**")
-                                for i, (rt, df) in enumerate(list(data_dict['raw_records'].items())[:10]):
-                                    st.write(f"{i+1}. `{rt}` - {len(df)} records")
-                            
-                            st.markdown("---")
-                            st.markdown("### 🔧 System Info")
-                            import platform
-                            st.write(f"**Python version:** {platform.python_version()}")
-                            st.write(f"**Platform:** {platform.platform()}")
-                            
-                            st.markdown("---")
-                            st.markdown("### 🎯 CodeExecutor Debug Info")
-                            if executor_debug_info:
-                                st.write("**Globals before execution:**")
-                                st.json(executor_debug_info.get('globals_before', {}))
-                                
-                                st.write("**Timestamp status:**")
-                                st.write(f"- Set: {executor_debug_info.get('timestamp_set', False)}")
-                                if executor_debug_info.get('timestamp_set'):
-                                    st.write(f"- Value: `{executor_debug_info.get('timestamp_value', 'N/A')}`")
-                                
-                                st.write("**Output dir status:**")
-                                st.write(f"- Set: {executor_debug_info.get('output_dir_set', False)}")
-                                if executor_debug_info.get('output_dir_set'):
-                                    st.write(f"- Value: `{executor_debug_info.get('output_dir_value', 'N/A')}`")
-                                
-                                if executor_debug_info.get('error_details'):
-                                    st.write("**Error details from CodeExecutor:**")
-                                    st.json(executor_debug_info['error_details'])
+                                    # Success! Clear retry count and display results
+                                    st.success("✅ Code fixed and executed successfully!")
+                                    st.session_state['error_retry_count'] = 0
+                                    
+                                    # Display captured figures
+                                    if captured_figures_retry:
+                                        for fig in captured_figures_retry:
+                                            st.pyplot(fig)
+                                    
+                                    if output_retry:
+                                        st.caption(f"Output: {output_retry}")
+                                    if errors_retry:
+                                        st.caption(f"Warnings: {errors_retry}")
+                                    
+                                    # Store successful message
+                                    message_data = {
+                                        "role": "assistant",
+                                        "type": "plot",
+                                        "content": "Visualization generated (fixed after error)",
+                                        "code": fixed_code
+                                    }
+                                    st.session_state.messages.append(message_data)
+                                    
+                                    # Skip the error display below - use a flag instead of continue
+                                    error_handled = True
                             else:
-                                st.warning("⚠️ No debug info available from CodeExecutor")
+                                st.error("❌ Could not generate fixed code. Showing original error.")
+                                st.session_state['error_retry_count'] = retry_count + 1
+                                error_handled = False
+                        else:
+                            # Max retries reached - show error
+                            st.error(f"❌ Error executing code (max retries reached):\n```\n{error_msg}\n```")
+                            st.session_state['error_retry_count'] = 0  # Reset for next query
+                            error_handled = False
+                        
+                        # Only show error details if error wasn't successfully handled
+                        if not error_handled:
+                            # Show error FIRST - make it VERY visible
+                            if retry_count >= max_retries:
+                                st.error(f"❌ Error executing code:\n```\n{error_msg}\n```")
                             
-                            # Show the actual code that would be executed
-                            st.markdown("---")
-                            st.markdown("### 💻 Code Analysis")
-                            st.write("**Code length:**", len(code), "characters")
-                            st.write("**Code uses 'timestamp':**", 'timestamp' in code)
+                            # Store error state for debug panel OUTSIDE chat message
+                            st.session_state['last_error'] = {
+                                'error_msg': error_msg,
+                                'code': code,
+                                'executor_debug_info': executor_debug_info,
+                                'data_dict_keys': list(data_dict.keys())[:30]
+                            }
                             
-                            if 'timestamp' in code:
-                                # Show context around timestamp usage
-                                st.write("**Context around timestamp usage:**")
-                                for i, line in enumerate(lines):
+                            # Additional details in expander
+                            with st.expander("📋 Additional Debug Details", expanded=False):
+                                st.markdown("### 📋 Full Generated Code")
+                                st.code(code, language="python")
+                                
+                                st.markdown("---")
+                                st.markdown("### 🔍 Error Details")
+                                st.code(error_msg, language="python")
+                                
+                                st.markdown("---")
+                                st.markdown("### 📦 Data Dictionary Contents")
+                                st.write("**Keys in data_dict:**")
+                                st.write(list(data_dict.keys())[:30])
+                                st.write(f"**Total keys: {len(data_dict)}**")
+                                
+                                st.write("**output_dir in data_dict:**")
+                                st.write(f"- Present: {'output_dir' in data_dict}")
+                                if 'output_dir' in data_dict:
+                                    st.write(f"- Value: `{data_dict['output_dir']}`")
+                                    st.write(f"- Exists: {os.path.exists(data_dict['output_dir']) if data_dict['output_dir'] else False}")
+                                
+                                st.write("**timestamp in data_dict:**")
+                                st.write(f"- Present: {'timestamp' in data_dict}")
+                                if 'timestamp' in data_dict:
+                                    st.write(f"- Value: `{data_dict['timestamp']}`")
+                                
+                                st.markdown("---")
+                                st.markdown("### 🔎 Code Analysis")
+                                
+                                # Find all timestamp usage
+                                lines = code.split('\n')
+                                timestamp_lines = []
+                                for i, line in enumerate(lines, 1):
                                     if 'timestamp' in line:
-                                        start = max(0, i-2)
-                                        end = min(len(lines), i+3)
-                                        context = '\n'.join(f"{j+1:4d}: {lines[j]}" for j in range(start, end))
-                                        st.code(context, language="python")
-                                        break
+                                        timestamp_lines.append((i, line.strip()))
+                                
+                                if timestamp_lines:
+                                    st.write("**Lines containing 'timestamp':**")
+                                    for line_num, line_content in timestamp_lines:
+                                        st.code(f"Line {line_num}: {line_content}", language="python")
+                                else:
+                                    st.warning("⚠️ No lines found containing 'timestamp'")
+                                
+                                st.markdown("---")
+                                st.markdown("### 🗂️ Execution Environment")
+                                
+                                # Try to get what would be in safe_globals
+                                st.write("**Expected variables in execution context:**")
+                                expected_vars = [
+                                    'timestamp', 'output_dir', 'pd', 'np', 'plt', 'st', 
+                                    'date', 'timedelta', 'datetime', 'os'
+                                ]
+                                for var in expected_vars:
+                                    if var in data_dict:
+                                        st.write(f"- ✓ `{var}`: Present in data_dict")
+                                    elif var == 'timestamp':
+                                        st.write(f"- ✗ `{var}`: **MISSING** (should be added by CodeExecutor)")
+                                    elif var == 'output_dir':
+                                        st.write(f"- {'✓' if 'output_dir' in data_dict else '✗'} `{var}`: {'Present' if 'output_dir' in data_dict else 'MISSING'}")
+                                    else:
+                                        st.write(f"- ✓ `{var}`: Should be available (built-in/module)")
+                                
+                                st.markdown("---")
+                                st.markdown("### 📊 Raw Records Available")
+                                if 'raw_records' in data_dict:
+                                    st.write(f"**Number of record types: {len(data_dict['raw_records'])}**")
+                                    st.write("**First 10 record types:**")
+                                    for i, (rt, df) in enumerate(list(data_dict['raw_records'].items())[:10]):
+                                        st.write(f"{i+1}. `{rt}` - {len(df)} records")
+                                
+                                st.markdown("---")
+                                st.markdown("### 🔧 System Info")
+                                import platform
+                                st.write(f"**Python version:** {platform.python_version()}")
+                                st.write(f"**Platform:** {platform.platform()}")
+                                
+                                st.markdown("---")
+                                st.markdown("### 🎯 CodeExecutor Debug Info")
+                                if executor_debug_info:
+                                    st.write("**Globals before execution:**")
+                                    st.json(executor_debug_info.get('globals_before', {}))
+                                    
+                                    st.write("**Timestamp status:**")
+                                    st.write(f"- Set: {executor_debug_info.get('timestamp_set', False)}")
+                                    if executor_debug_info.get('timestamp_set'):
+                                        st.write(f"- Value: `{executor_debug_info.get('timestamp_value', 'N/A')}`")
+                                    
+                                    st.write("**Output dir status:**")
+                                    st.write(f"- Set: {executor_debug_info.get('output_dir_set', False)}")
+                                    if executor_debug_info.get('output_dir_set'):
+                                        st.write(f"- Value: `{executor_debug_info.get('output_dir_value', 'N/A')}`")
+                                    
+                                    if executor_debug_info.get('error_details'):
+                                        st.write("**Error details from CodeExecutor:**")
+                                        st.json(executor_debug_info['error_details'])
+                                else:
+                                    st.warning("⚠️ No debug info available from CodeExecutor")
+                                
+                                # Show the actual code that would be executed
+                                st.markdown("---")
+                                st.markdown("### 💻 Code Analysis")
+                                st.write("**Code length:**", len(code), "characters")
+                                st.write("**Code uses 'timestamp':**", 'timestamp' in code)
+                                
+                                if 'timestamp' in code:
+                                    # Show context around timestamp usage
+                                    st.write("**Context around timestamp usage:**")
+                                    for i, line in enumerate(lines):
+                                        if 'timestamp' in line:
+                                            start = max(0, i-2)
+                                            end = min(len(lines), i+3)
+                                            context = '\n'.join(f"{j+1:4d}: {lines[j]}" for j in range(start, end))
+                                            st.code(context, language="python")
+                                            break
+                                
+                                st.markdown("---")
+                                st.markdown("### 📝 Full Error Traceback")
+                                st.code(error_msg, language="python")
                             
-                            st.markdown("---")
-                            st.markdown("### 📝 Full Error Traceback")
-                            st.code(error_msg, language="python")
-                        # Store error with full debug info
-                        error_message_data = {
-                            "role": "assistant",
-                            "type": "error",
-                            "content": f"Error: {error_msg}",
-                            "code": code,  # Store code for reference
-                            "debug_info": executor_debug_info,
-                            "data_dict_keys": list(data_dict.keys())[:30]
-                        }
-                        st.session_state.messages.append(error_message_data)
+                            # Store error with full debug info
+                            error_message_data = {
+                                "role": "assistant",
+                                "type": "error",
+                                "content": f"Error: {error_msg}",
+                                "code": code,  # Store code for reference
+                                "debug_info": executor_debug_info,
+                                "data_dict_keys": list(data_dict.keys())[:30]
+                            }
+                            st.session_state.messages.append(error_message_data)
                     else:
                         # Display captured figures
                         if captured_figures:

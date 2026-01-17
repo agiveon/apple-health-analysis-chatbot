@@ -52,8 +52,9 @@ class Config:
                 "max_tokens": 4096
             },
             "openai": {
-                "model": "gpt-4o",
+                "model": "gpt-5.1-chat-latest",
                 "model_alternatives": [
+                    "gpt-5.1-chat-latest",
                     "gpt-4o",
                     "gpt-4-turbo",
                     "gpt-4",
