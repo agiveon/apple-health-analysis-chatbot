@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 import os
 import pickle
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -16,7 +17,11 @@ from health_data.config import Config
 from health_data.cache import load_all_health_data, get_data_summary
 from health_data.ai_client import get_ai_client
 from health_data.code_executor import CodeExecutor
-from health_data.prompts import build_analysis_prompt, get_data_structure_info, build_conversation_context, build_error_recovery_prompt
+from health_data.prompts import (
+    build_analysis_prompt, get_data_structure_info, build_conversation_context, 
+    build_error_recovery_prompt, build_reasoning_prompt, build_code_generation_prompt,
+    load_table_summaries
+)
 from health_data.zip_handler import extract_health_export, get_zip_directory
 from health_data.checkpoint import CheckpointManager
 
@@ -475,8 +480,18 @@ for message in st.session_state.messages:
 
 # Chat input
 if prompt := st.chat_input("Ask a question about your health data..."):
+    import sys
+    from datetime import datetime
+    
     # Reset error retry count for new query
     st.session_state['error_retry_count'] = 0
+    
+    # Log user query
+    query_start_time = time.time()
+    print(f"\n{'='*80}", file=sys.__stderr__)
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [App] ========== NEW USER QUERY ==========", file=sys.__stderr__)
+    print(f"[App] User query: {prompt}", file=sys.__stderr__)
+    print(f"{'='*80}\n", file=sys.__stderr__)
     
     # If this is the first message in a new conversation, we'll create it after getting response
     # Add user message to history
@@ -490,37 +505,237 @@ if prompt := st.chat_input("Ask a question about your health data..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
-                # Get data summary and structure
-                summary = get_data_summary(data)
-                if isinstance(summary, dict):
-                    summary_str = f"""
-Total record types: {summary.get('total_record_types', 0)}
-Total records: {summary.get('total_records', 0):,}
-Categories: {', '.join(summary.get('categories', {}).keys())}
-Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', {}).items(), key=lambda x: x[1], reverse=True)[:10]])}
-"""
-                else:
-                    summary_str = str(summary)
-                
-                data_structure = get_data_structure_info(data)
-                conversation_context = build_conversation_context(st.session_state.messages[:-1])
-                
-                # Build prompt
-                full_prompt = build_analysis_prompt(
-                    prompt,
-                    summary_str,
-                    data_structure,
-                    conversation_context
-                )
-                
                 # Initialize AI client (Claude or OpenAI based on available API key)
                 config = Config()
                 ai_client = get_ai_client(config)
+                client_type = type(ai_client).__name__
+                print(f"[App] Using AI client: {client_type}", file=sys.__stderr__)
                 
-                # Generate response
-                response = ai_client.generate_response(full_prompt)
+                conversation_context = build_conversation_context(st.session_state.messages[:-1])
+                print(f"[App] Conversation context length: {len(conversation_context)} characters", file=sys.__stderr__)
+                
+                # STEP 1: Reasoning - Determine which tables to use
+                # Load table summaries
+                table_summaries_file = data.get('table_summaries_file')
+                if not table_summaries_file:
+                    # Fallback: try to find it relative to cache
+                    cache_path = st.session_state.get('cache_path', '')
+                    if cache_path:
+                        cache_dir = os.path.dirname(cache_path)
+                        table_summaries_file = os.path.join(cache_dir, "table_summaries.json")
+                
+                if table_summaries_file and os.path.exists(table_summaries_file):
+                    table_summaries = load_table_summaries(table_summaries_file)
+                else:
+                    # Fallback: use table_summaries from data if available
+                    table_summaries = data.get('table_summaries', {})
+                
+                # Initialize variables for error recovery (need to be accessible in error handling)
+                selected_tables = []
+                reasoning_text = ""
+                use_two_step = False
+                table_summaries_for_recovery = {}
+                
+                if table_summaries:
+                    table_summaries_for_recovery = table_summaries
+                    # Two-step agentic workflow
+                    use_two_step = True
+                    st.info("🔍 Step 1: Analyzing request and selecting tables...")
+                    
+                    print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                    print(f"[App] STEP 1: REASONING PHASE", file=sys.__stderr__)
+                    print(f"[App] Available tables: {len(table_summaries)}", file=sys.__stderr__)
+                    
+                    # Step 1: Reasoning
+                    reasoning_prompt = build_reasoning_prompt(
+                        prompt,
+                        table_summaries,
+                        conversation_context
+                    )
+                    
+                    prompt_size = len(reasoning_prompt)
+                    print(f"[App] Reasoning prompt size: {prompt_size:,} characters (~{prompt_size//4:,} tokens estimated)", file=sys.__stderr__)
+                    print(f"[App] Calling LLM for reasoning...", file=sys.__stderr__)
+                    
+                    reasoning_start_time = time.time()
+                    reasoning_response = ai_client.generate_response(reasoning_prompt)
+                    reasoning_elapsed = time.time() - reasoning_start_time
+                    
+                    # Log token usage
+                    usage = reasoning_response.get("usage", {})
+                    model_used = reasoning_response.get("model", "unknown")
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                    total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+                    
+                    print(f"[App] ✓ Reasoning completed in {reasoning_elapsed:.2f}s", file=sys.__stderr__)
+                    print(f"[App] Model used: {model_used}", file=sys.__stderr__)
+                    if total_tokens > 0:
+                        print(f"[App] Token usage: {input_tokens:,} input + {output_tokens:,} output = {total_tokens:,} total", file=sys.__stderr__)
+                    print(f"[App] {'='*60}\n", file=sys.__stderr__)
+                    
+                    # Handle reasoning response - check if it's a text response
+                    response = None  # Initialize response
+                    if reasoning_response.get("type") == "text":
+                        # This is a text question, not code generation
+                        print(f"[App] Reasoning determined this is a TEXT QUESTION", file=sys.__stderr__)
+                        response = reasoning_response  # Use this as the final response
+                        use_two_step = False  # Skip code generation step
+                    elif reasoning_response.get("type") == "reasoning":
+                        reasoning_text = reasoning_response.get("content", "")
+                        
+                        # Extract table names from reasoning
+                        import re
+                        # Look for HKQuantityTypeIdentifier, HKCategoryTypeIdentifier, etc.
+                        table_pattern = r'(HK(?:Quantity|Category|Workout)TypeIdentifier[A-Za-z0-9_]+(?:_daily)?)'
+                        found_tables = re.findall(table_pattern, reasoning_text)
+                        selected_tables = list(set(found_tables))  # Remove duplicates
+                        
+                        # Also check in table_summaries to validate
+                        selected_tables = [t for t in selected_tables if t in table_summaries or f"{t}_daily" in table_summaries]
+                        
+                        print(f"[App] Tables extracted from reasoning: {len(selected_tables)}", file=sys.__stderr__)
+                        if selected_tables:
+                            print(f"[App] Selected tables:", file=sys.__stderr__)
+                            for i, table in enumerate(selected_tables[:10], 1):
+                                record_count = table_summaries.get(table, {}).get('record_count', 0)
+                                print(f"[App]   {i}. {table} ({record_count:,} records)", file=sys.__stderr__)
+                            if len(selected_tables) > 10:
+                                print(f"[App]   ... and {len(selected_tables) - 10} more", file=sys.__stderr__)
+                        else:
+                            print(f"[App] ⚠ No tables extracted from reasoning", file=sys.__stderr__)
+                    else:
+                        # Fallback: treat as text
+                        reasoning_text = reasoning_response.get("content", "")
+                        selected_tables = []
+                    
+                    # If we already have a text response from reasoning, skip code generation
+                    if response and response.get("type") == "text":
+                        # Text response already set, skip code generation
+                        pass
+                    # If no tables found and not a text response, try to infer from common patterns
+                    elif not selected_tables and reasoning_response.get("type") != "text":
+                        # Fallback: use old method for now
+                        st.warning("⚠️ Could not extract table names from reasoning. Using fallback method.")
+                        use_two_step = False
+                        summary = get_data_summary(data)
+                        if isinstance(summary, dict):
+                            summary_str = f"""
+Total record types: {summary.get('total_record_types', 0)}
+Total records: {summary.get('total_records', 0):,}
+Categories: {', '.join(summary.get('categories', {}).keys())}
+"""
+                        else:
+                            summary_str = str(summary)
+                        
+                        data_structure = get_data_structure_info(data)
+                        full_prompt = build_analysis_prompt(
+                            prompt,
+                            summary_str,
+                            data_structure,
+                            conversation_context
+                        )
+                        response = ai_client.generate_response(full_prompt)
+                    elif selected_tables:
+                        # Step 2: Code generation with selected tables
+                        st.info(f"📊 Step 2: Generating code using tables: {', '.join(selected_tables[:3])}{'...' if len(selected_tables) > 3 else ''}")
+                        
+                        print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                        print(f"[App] STEP 2: CODE GENERATION PHASE", file=sys.__stderr__)
+                        print(f"[App] Generating code for {len(selected_tables)} selected table(s)", file=sys.__stderr__)
+                        
+                        code_prompt = build_code_generation_prompt(
+                            prompt,
+                            selected_tables,
+                            table_summaries,
+                            conversation_context
+                        )
+                        
+                        prompt_size = len(code_prompt)
+                        print(f"[App] Code generation prompt size: {prompt_size:,} characters (~{prompt_size//4:,} tokens estimated)", file=sys.__stderr__)
+                        print(f"[App] Calling LLM for code generation...", file=sys.__stderr__)
+                        
+                        code_start_time = time.time()
+                        response = ai_client.generate_response(code_prompt)
+                        code_elapsed = time.time() - code_start_time
+                        
+                        # Log token usage
+                        usage = response.get("usage", {})
+                        model_used = response.get("model", "unknown")
+                        input_tokens = usage.get("input_tokens", 0)
+                        output_tokens = usage.get("output_tokens", 0)
+                        total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+                        
+                        print(f"[App] ✓ Code generation completed in {code_elapsed:.2f}s", file=sys.__stderr__)
+                        print(f"[App] Model used: {model_used}", file=sys.__stderr__)
+                        if total_tokens > 0:
+                            print(f"[App] Token usage: {input_tokens:,} input + {output_tokens:,} output = {total_tokens:,} total", file=sys.__stderr__)
+                        print(f"[App] {'='*60}\n", file=sys.__stderr__)
+                        
+                        # Check if code generation returned text instead of code
+                        if response.get("type") == "text":
+                            print(f"[App] Code generation returned TEXT_RESPONSE instead of code", file=sys.__stderr__)
+                            # Use this as the final response, skip code execution
+                        
+                        # Store reasoning in conversation
+                        if reasoning_text:
+                            reasoning_msg = {
+                                "role": "assistant",
+                                "type": "reasoning",
+                                "content": reasoning_text,
+                                "selected_tables": selected_tables
+                            }
+                            st.session_state.messages.append(reasoning_msg)
+                else:
+                    # Fallback to old method if no table summaries available
+                    st.warning("⚠️ Table summaries not available. Using fallback method.")
+                    
+                    print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                    print(f"[App] FALLBACK MODE: Single-step prompt (no table summaries)", file=sys.__stderr__)
+                    
+                    summary = get_data_summary(data)
+                    if isinstance(summary, dict):
+                        summary_str = f"""
+Total record types: {summary.get('total_record_types', 0)}
+Total records: {summary.get('total_records', 0):,}
+Categories: {', '.join(summary.get('categories', {}).keys())}
+"""
+                    else:
+                        summary_str = str(summary)
+                    
+                    data_structure = get_data_structure_info(data)
+                    full_prompt = build_analysis_prompt(
+                        prompt,
+                        summary_str,
+                        data_structure,
+                        conversation_context
+                    )
+                    
+                    prompt_size = len(full_prompt)
+                    print(f"[App] Prompt size: {prompt_size:,} characters (~{prompt_size//4:,} tokens estimated)", file=sys.__stderr__)
+                    print(f"[App] Calling LLM...", file=sys.__stderr__)
+                    
+                    prompt_start_time = time.time()
+                    response = ai_client.generate_response(full_prompt)
+                    prompt_elapsed = time.time() - prompt_start_time
+                    
+                    # Log token usage
+                    usage = response.get("usage", {})
+                    model_used = response.get("model", "unknown")
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                    total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+                    
+                    print(f"[App] ✓ Response generated in {prompt_elapsed:.2f}s", file=sys.__stderr__)
+                    print(f"[App] Model used: {model_used}", file=sys.__stderr__)
+                    if total_tokens > 0:
+                        print(f"[App] Token usage: {input_tokens:,} input + {output_tokens:,} output = {total_tokens:,} total", file=sys.__stderr__)
+                    print(f"[App] {'='*60}\n", file=sys.__stderr__)
                 
                 if response["type"] == "text":
+                    print(f"[App] Response type: TEXT", file=sys.__stderr__)
+                    print(f"[App] Response length: {len(response['content']):,} characters", file=sys.__stderr__)
+                    
                     st.write(response["content"])
                     assistant_msg = {
                         "role": "assistant",
@@ -528,33 +743,42 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                         "content": response["content"]
                     }
                     st.session_state.messages.append(assistant_msg)
+                    
+                    print(f"[App] ✓ Query completed successfully!", file=sys.__stderr__)
                 
                 elif response["type"] == "code":
                     code = response["content"]
-                    import sys
-                    # Use __stderr__ to bypass Streamlit capture - goes directly to terminal
-                    print(f"[App] ========== CODE EXECUTION START ==========", file=sys.__stderr__)
-                    print(f"[App] Generated code type: code", file=sys.__stderr__)
-                    print(f"[App] Code length: {len(code)} characters", file=sys.__stderr__)
-                    print(f"[App] Code preview:\n{code[:500]}", file=sys.__stderr__)
-                    print(f"[App] Data dict keys: {list(data_dict.keys())[:10]}", file=sys.__stderr__)
-                    print(f"[App] Output dir in data_dict: {'output_dir' in data_dict}", file=sys.__stderr__)
-                    if 'output_dir' in data_dict:
-                        print(f"[App] Output dir value: {data_dict['output_dir']}", file=sys.__stderr__)
                     
+                    print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                    print(f"[App] STEP 3: CODE EXECUTION PHASE", file=sys.__stderr__)
+                    print(f"[App] Code length: {len(code):,} characters ({len(code.splitlines())} lines)", file=sys.__stderr__)
+                    print(f"[App] Code preview (first 3 lines):", file=sys.__stderr__)
+                    for i, line in enumerate(code.splitlines()[:3], 1):
+                        print(f"[App]   {i}: {line[:80]}", file=sys.__stderr__)
+                    print(f"[App] Available data tables: {len([k for k in data_dict.keys() if not k.startswith('qty_')])}", file=sys.__stderr__)
+                    print(f"[App] Output directory: {data_dict.get('output_dir', 'Not set')}", file=sys.__stderr__)
+                    print(f"[App] Executing code...", file=sys.__stderr__)
+                    
+                    exec_start_time = time.time()
                     executor = CodeExecutor(data_dict)
                     output, errors, error_msg, captured_figures = executor.execute(
                         code, 
                         capture_figures=True
                     )
+                    exec_elapsed = time.time() - exec_start_time
                     
                     # Store executor debug info for UI
                     executor_debug_info = getattr(executor, 'debug_info', {})
                     
-                    print(f"[App] Execution result - output: {bool(output)}, errors: {bool(errors)}, error_msg: {bool(error_msg)}", file=sys.__stderr__)
+                    print(f"[App] ✓ Code execution completed in {exec_elapsed:.2f}s", file=sys.__stderr__)
+                    print(f"[App] Execution result:", file=sys.__stderr__)
+                    print(f"[App]   - Output: {'Yes' if output else 'No'} ({len(output) if output else 0} chars)", file=sys.__stderr__)
+                    print(f"[App]   - Errors/Warnings: {'Yes' if errors else 'No'} ({len(errors) if errors else 0} chars)", file=sys.__stderr__)
+                    print(f"[App]   - Error message: {'Yes' if error_msg else 'No'}", file=sys.__stderr__)
+                    print(f"[App]   - Figures captured: {len(captured_figures)}", file=sys.__stderr__)
                     if error_msg:
-                        print(f"[App] ERROR MESSAGE: {error_msg[:500]}", file=sys.__stderr__)
-                    print(f"[App] ========== CODE EXECUTION END ==========", file=sys.__stderr__)
+                        print(f"[App] ⚠ ERROR: {error_msg[:200]}", file=sys.__stderr__)
+                    print(f"[App] {'='*60}\n", file=sys.__stderr__)
                     
                     if error_msg:
                         import sys
@@ -572,37 +796,101 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                             # Show that we're retrying
                             st.warning(f"⚠️ Error detected. Attempting to fix and retry... (attempt {retry_count + 1}/{max_retries + 1})")
                             
-                            # Build error recovery prompt
-                            recovery_prompt = build_error_recovery_prompt(
-                                original_query=prompt,
-                                failed_code=code,
-                                error_message=error_msg,
-                                data_summary=summary_str,
-                                data_structure_info=data_structure,
-                                conversation_context=build_conversation_context(st.session_state.messages)
-                            )
+                            print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                            print(f"[App] ERROR RECOVERY PHASE (Attempt {retry_count + 1}/{max_retries + 1})", file=sys.__stderr__)
+                            print(f"[App] Error type: {type(error_msg).__name__ if error_msg else 'Unknown'}", file=sys.__stderr__)
+                            print(f"[App] Error message: {error_msg[:300]}", file=sys.__stderr__)
+                            
+                            # Build error recovery prompt - use table summaries if available
+                            if use_two_step and selected_tables and table_summaries_for_recovery:
+                                print(f"[App] Using two-step recovery with {len(selected_tables)} selected tables", file=sys.__stderr__)
+                                recovery_prompt = build_error_recovery_prompt(
+                                    original_query=prompt,
+                                    failed_code=code,
+                                    error_message=error_msg,
+                                    selected_tables=selected_tables,
+                                    table_summaries=table_summaries_for_recovery,
+                                    conversation_context=build_conversation_context(st.session_state.messages)
+                                )
+                            else:
+                                print(f"[App] Using fallback recovery method", file=sys.__stderr__)
+                                # Fallback to old method
+                                if 'summary_str' not in locals():
+                                    summary = get_data_summary(data)
+                                    if isinstance(summary, dict):
+                                        summary_str = f"""
+Total record types: {summary.get('total_record_types', 0)}
+Total records: {summary.get('total_records', 0):,}
+Categories: {', '.join(summary.get('categories', {}).keys())}
+"""
+                                    else:
+                                        summary_str = str(summary)
+                                
+                                if 'data_structure' not in locals():
+                                    data_structure = get_data_structure_info(data)
+                                
+                                recovery_prompt = build_error_recovery_prompt(
+                                    original_query=prompt,
+                                    failed_code=code,
+                                    error_message=error_msg,
+                                    data_summary=summary_str,
+                                    data_structure_info=data_structure,
+                                    conversation_context=build_conversation_context(st.session_state.messages)
+                                )
+                            
+                            prompt_size = len(recovery_prompt)
+                            print(f"[App] Recovery prompt size: {prompt_size:,} characters (~{prompt_size//4:,} tokens estimated)", file=sys.__stderr__)
+                            print(f"[App] Calling LLM for error recovery...", file=sys.__stderr__)
                             
                             # Generate fixed code
+                            recovery_start_time = time.time()
                             recovery_response = ai_client.generate_response(recovery_prompt)
+                            recovery_elapsed = time.time() - recovery_start_time
+                            
+                            # Log token usage
+                            usage = recovery_response.get("usage", {})
+                            model_used = recovery_response.get("model", "unknown")
+                            input_tokens = usage.get("input_tokens", 0)
+                            output_tokens = usage.get("output_tokens", 0)
+                            total_tokens = usage.get("total_tokens", input_tokens + output_tokens)
+                            
+                            print(f"[App] ✓ Recovery code generated in {recovery_elapsed:.2f}s", file=sys.__stderr__)
+                            print(f"[App] Model used: {model_used}", file=sys.__stderr__)
+                            if total_tokens > 0:
+                                print(f"[App] Token usage: {input_tokens:,} input + {output_tokens:,} output = {total_tokens:,} total", file=sys.__stderr__)
                             
                             if recovery_response["type"] == "code":
                                 fixed_code = recovery_response["content"]
                                 
+                                print(f"[App] Fixed code length: {len(fixed_code):,} characters ({len(fixed_code.splitlines())} lines)", file=sys.__stderr__)
+                                
                                 # Try executing the fixed code
                                 st.info("🔄 Executing fixed code...")
+                                print(f"[App] Executing fixed code...", file=sys.__stderr__)
+                                
+                                retry_exec_start_time = time.time()
                                 executor_retry = CodeExecutor(data_dict)
                                 output_retry, errors_retry, error_msg_retry, captured_figures_retry = executor_retry.execute(
                                     fixed_code,
                                     capture_figures=True
                                 )
+                                retry_exec_elapsed = time.time() - retry_exec_start_time
                                 
                                 if error_msg_retry:
                                     # Still failed after retry - show error
+                                    print(f"[App] ✗ Retry failed after {retry_exec_elapsed:.2f}s", file=sys.__stderr__)
+                                    print(f"[App] Error: {error_msg_retry[:300]}", file=sys.__stderr__)
+                                    print(f"[App] {'='*60}\n", file=sys.__stderr__)
                                     st.error(f"❌ Error still occurred after retry:\n```\n{error_msg_retry}\n```")
                                     st.session_state['error_retry_count'] = retry_count + 1
                                     error_handled = False
                                 else:
                                     # Success! Clear retry count and display results
+                                    print(f"[App] ✓ Retry successful! Execution completed in {retry_exec_elapsed:.2f}s", file=sys.__stderr__)
+                                    print(f"[App]   - Output: {'Yes' if output_retry else 'No'}", file=sys.__stderr__)
+                                    print(f"[App]   - Figures: {len(captured_figures_retry)}", file=sys.__stderr__)
+                                    print(f"[App] {'='*60}\n", file=sys.__stderr__)
+                                    
                                     st.success("✅ Code fixed and executed successfully!")
                                     st.session_state['error_retry_count'] = 0
                                     
@@ -781,6 +1069,11 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                             }
                             st.session_state.messages.append(error_message_data)
                     else:
+                        # Success! Display results
+                        print(f"[App] ✓ Query completed successfully!", file=sys.__stderr__)
+                        print(f"[App]   - Figures displayed: {len(captured_figures)}", file=sys.__stderr__)
+                        print(f"[App]   - Output length: {len(output) if output else 0} chars", file=sys.__stderr__)
+                        
                         # Display captured figures
                         if captured_figures:
                             for fig in captured_figures:
@@ -807,9 +1100,12 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                 import sys
                 import traceback
                 error_msg = f"Error: {str(e)}\n{traceback.format_exc()}"
-                print(f"[App] ========== TOP LEVEL EXCEPTION ==========", file=sys.__stderr__)
+                print(f"\n[App] {'='*60}", file=sys.__stderr__)
+                print(f"[App] TOP LEVEL EXCEPTION", file=sys.__stderr__)
                 print(f"[App] Error: {error_msg}", file=sys.__stderr__)
-                print(f"[App] =========================================", file=sys.__stderr__)
+                print(f"[App] Traceback:", file=sys.__stderr__)
+                print(traceback.format_exc(), file=sys.__stderr__)
+                print(f"[App] {'='*60}\n", file=sys.__stderr__)
                 
                 st.error(f"❌ Error: {str(e)}")
                 
@@ -838,3 +1134,12 @@ Top record types: {', '.join([k for k, v in sorted(summary.get('record_counts', 
                     "type": "error",
                     "content": error_msg
                 })
+            
+            # Final summary for the query (always runs, whether successful or not)
+            if 'query_start_time' in locals():
+                query_end_time = time.time()
+                query_total_time = query_end_time - query_start_time
+                print(f"\n[App] {'='*80}", file=sys.__stderr__)
+                print(f"[App] QUERY SUMMARY", file=sys.__stderr__)
+                print(f"[App] Total processing time: {query_total_time:.2f}s ({query_total_time/60:.1f} minutes)", file=sys.__stderr__)
+                print(f"[App] {'='*80}\n", file=sys.__stderr__)

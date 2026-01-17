@@ -74,28 +74,61 @@ class OpenAIClient:
         # Extract response
         response = response_obj.choices[0].message.content.strip()
         
-        # Check if it's a text response or code
+        # Extract token usage if available
+        usage_info = {}
+        if hasattr(response_obj, 'usage'):
+            usage_info = {
+                "input_tokens": getattr(response_obj.usage, 'prompt_tokens', 0),
+                "output_tokens": getattr(response_obj.usage, 'completion_tokens', 0),
+                "total_tokens": getattr(response_obj.usage, 'total_tokens', 0),
+            }
+        
+        # Check if it's a text response, reasoning, or code
+        result = {}
         if response.startswith("TEXT_RESPONSE:"):
             text_answer = response.replace("TEXT_RESPONSE:", "").strip()
-            return {"type": "text", "content": text_answer}
+            result = {"type": "text", "content": text_answer}
+        elif response.startswith("REASONING:"):
+            reasoning = response.replace("REASONING:", "").strip()
+            result = {"type": "reasoning", "content": reasoning}
         elif response.startswith("CODE:"):
-            code = response.replace("CODE:", "").strip()
+            code = response.replace("CODE:", "", 1).strip()  # Only replace first occurrence
             code = self._clean_code(code)
-            return {"type": "code", "content": code}
+            result = {"type": "code", "content": code}
         else:
             # Default: assume it's code if it contains Python-like syntax, otherwise text
             if "fig" in response or "plt." in response or "ax." in response:
-                return {"type": "code", "content": self._clean_code(response)}
+                result = {"type": "code", "content": self._clean_code(response)}
             else:
-                return {"type": "text", "content": response}
+                result = {"type": "text", "content": response}
+        
+        # Add usage info and model used
+        result["usage"] = usage_info
+        result["model"] = model
+        
+        return result
     
     def _clean_code(self, code: str) -> str:
-        """Remove markdown code blocks from code string"""
+        """Remove markdown code blocks and any remaining CODE: prefixes from code string"""
+        # Remove markdown code blocks
         if code.startswith("```python"):
             code = code[9:]
         elif code.startswith("```"):
             code = code[3:]
         if code.endswith("```"):
             code = code[:-3]
-        return code.strip()
+        
+        # Remove any remaining "CODE:" prefixes (in case LLM includes it multiple times)
+        while code.strip().startswith("CODE:"):
+            code = code.replace("CODE:", "", 1).strip()
+        
+        # Remove leading/trailing whitespace and newlines
+        code = code.strip()
+        
+        # Remove any leading empty lines
+        lines = code.split('\n')
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        
+        return '\n'.join(lines)
 

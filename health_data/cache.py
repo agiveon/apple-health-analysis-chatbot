@@ -10,16 +10,23 @@ except ImportError:
     LXML_AVAILABLE = False
 
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import os
 import pickle
+import json
 from collections import defaultdict
 from pathlib import Path
+from typing import Dict, Any
 import multiprocessing as mp
 from functools import partial
 import sys
 import time
+import threading
 import warnings
+
+# Global lock to prevent concurrent parsing of the same file
+_parse_locks = {}
+_parse_lock_global = threading.Lock()
 
 # Suppress Streamlit context warnings in worker processes
 # These warnings occur because worker processes don't have Streamlit's ScriptRunContext
@@ -170,289 +177,304 @@ def parse_health_export(export_path, progress_callback=None, checkpoint_manager=
         - cache_date: When data was parsed
         - total_records: Total number of records
     """
-    start_time = time.time()
-    print(f"\n{'='*80}", file=sys.__stderr__)
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting parse_health_export", file=sys.__stderr__)
-    print(f"[Cache] Export path: {export_path}", file=sys.__stderr__)
-    print(f"[Cache] File size: {os.path.getsize(export_path) / (1024*1024):.2f} MB", file=sys.__stderr__)
-    print(f"[Cache] Using {'lxml' if LXML_AVAILABLE else 'ElementTree'} parser", file=sys.__stderr__)
-    print(f"{'='*80}\n", file=sys.__stderr__)
+    # Use a per-file lock to prevent concurrent parsing of the same file
+    with _parse_lock_global:
+        if export_path not in _parse_locks:
+            _parse_locks[export_path] = threading.Lock()
+        file_lock = _parse_locks[export_path]
     
-    if not os.path.exists(export_path):
-        raise FileNotFoundError(f"Export file not found: {export_path}")
+    # Acquire the lock for this specific file (non-blocking first attempt)
+    if not file_lock.acquire(blocking=False):
+        # Another thread is already parsing this file - wait for it
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Another parsing operation is in progress for this file. Waiting...", file=sys.__stderr__)
+        file_lock.acquire(blocking=True)  # Wait for it to complete
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Previous parsing completed. Re-checking cache...", file=sys.__stderr__)
+        # The checkpoint/cache logic below will handle loading if available
+        file_lock.release()
+        return None  # Indicate that another process handled it
     
-    if progress_callback:
-        progress_callback(5, "Loading XML file...")
-    
-    # Dictionary to store all records by type
-    records_by_type = defaultdict(list)
-    record_metadata = defaultdict(dict)
-    
-    total_records = 0
-    
-    # Use iterparse for incremental parsing (much faster and more memory efficient)
-    # This processes records as they're encountered, without loading the entire tree
-    if LXML_AVAILABLE:
-        if progress_callback:
-            progress_callback(10, "Parsing XML records (this may take a few minutes)...")
+    try:
+        start_time = time.time()
+        print(f"\n{'='*80}", file=sys.__stderr__)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting parse_health_export", file=sys.__stderr__)
+        print(f"[Cache] Export path: {export_path}", file=sys.__stderr__)
+        print(f"[Cache] File size: {os.path.getsize(export_path) / (1024*1024):.2f} MB", file=sys.__stderr__)
+        print(f"[Cache] Using {'lxml' if LXML_AVAILABLE else 'ElementTree'} parser", file=sys.__stderr__)
+        print(f"{'='*80}\n", file=sys.__stderr__)
         
-        # Use iterparse for incremental parsing - much faster for large files
-        context = ET.iterparse(export_path, events=("start",), tag="Record", huge_tree=True)
-        
-        # Count records first for progress (quick pass)
-        count_start_time = time.time()
-        if progress_callback:
-            progress_callback(12, "Counting records...")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record counting phase...", file=sys.__stderr__)
-        
-        # Quick count pass with progress updates
-        count_context = ET.iterparse(export_path, events=("start",), tag="Record", huge_tree=True)
-        record_count = 0
-        count_update_interval = 200000  # Update every 200k records during counting
-        
-        for _ in count_context:
-            record_count += 1
-            if record_count % count_update_interval == 0:
-                elapsed = time.time() - count_start_time
-                rate = record_count / elapsed if elapsed > 0 else 0
-                if progress_callback:
-                    progress_callback(12, f"Counting records... ({record_count:,} found so far)")
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counted {record_count:,} records ({rate:,.0f} records/sec)", file=sys.__stderr__)
-        
-        count_elapsed = time.time() - count_start_time
-        if record_count == 0:
-            raise ValueError("No records found in export file")
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counting complete: {record_count:,} total records in {count_elapsed:.2f}s ({record_count/count_elapsed:,.0f} records/sec)", file=sys.__stderr__)
+        if not os.path.exists(export_path):
+            raise FileNotFoundError(f"Export file not found: {export_path}")
         
         if progress_callback:
-            progress_callback(12, f"Found {record_count:,} total records. Starting to parse...")
-        del count_context  # Free memory
+            progress_callback(5, "Loading XML file...")
         
-        # Parse records incrementally
-        parse_start_time = time.time()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record parsing phase...", file=sys.__stderr__)
+        # Dictionary to store all records by type
+        records_by_type = defaultdict(list)
+        record_metadata = defaultdict(dict)
         
-        for event, record in context:
-            record_type = record.attrib.get("type", "")
-            if not record_type:
-                record.clear()  # Free memory immediately
+        total_records = 0
+        
+        # Use iterparse for incremental parsing (much faster and more memory efficient)
+        # This processes records as they're encountered, without loading the entire tree
+        if LXML_AVAILABLE:
+            if progress_callback:
+                progress_callback(10, "Parsing XML records (this may take a few minutes)...")
+            
+            # Use iterparse for incremental parsing - much faster for large files
+            context = ET.iterparse(export_path, events=("start",), tag="Record", huge_tree=True)
+            
+            # Count records first for progress (quick pass)
+            count_start_time = time.time()
+            if progress_callback:
+                progress_callback(12, "Counting records...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record counting phase...", file=sys.__stderr__)
+            
+            # Quick count pass with progress updates
+            count_context = ET.iterparse(export_path, events=("start",), tag="Record", huge_tree=True)
+            record_count = 0
+            count_update_interval = 200000  # Update every 200k records during counting
+            
+            for _ in count_context:
+                record_count += 1
+                if record_count % count_update_interval == 0:
+                    elapsed = time.time() - count_start_time
+                    rate = record_count / elapsed if elapsed > 0 else 0
+                    if progress_callback:
+                        progress_callback(12, f"Counting records... ({record_count:,} found so far)")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counted {record_count:,} records ({rate:,.0f} records/sec)", file=sys.__stderr__)
+            
+            count_elapsed = time.time() - count_start_time
+            if record_count == 0:
+                raise ValueError("No records found in export file")
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counting complete: {record_count:,} total records in {count_elapsed:.2f}s ({record_count/count_elapsed:,.0f} records/sec)", file=sys.__stderr__)
+            
+            if progress_callback:
+                progress_callback(12, f"Found {record_count:,} total records. Starting to parse...")
+            del count_context  # Free memory
+            
+            # Parse records incrementally
+            parse_start_time = time.time()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record parsing phase...", file=sys.__stderr__)
+            
+            for event, record in context:
+                record_type = record.attrib.get("type", "")
+                if not record_type:
+                    record.clear()  # Free memory immediately
+                    continue
+                
+                total_records += 1
+                
+                # Update progress less frequently for very large files (every 200k records)
+                # This reduces UI overhead significantly - fewer updates = faster processing
+                update_interval = 200000  # Always update every 200k records
+                if progress_callback and record_count:
+                    if total_records % update_interval == 0 or total_records == 1 or total_records == record_count:
+                        # Progress from 15% to 70% based on records processed
+                        progress_pct = min(15 + int((total_records / record_count) * 55), 70)
+                        progress_callback(progress_pct, f"Processed {total_records:,} of {record_count:,} records...")
+                        
+                        # Terminal logging
+                        elapsed = time.time() - parse_start_time
+                        rate = total_records / elapsed if elapsed > 0 else 0
+                        pct = (total_records / record_count * 100) if record_count else 0
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsed {total_records:,}/{record_count:,} records ({pct:.1f}%) - {rate:,.0f} records/sec", file=sys.__stderr__)
+                
+                # Extract all attributes (use dict() for faster conversion)
+                record_data = dict(record.attrib)
+                
+                # Track metadata for this record type
+                if record_type not in record_metadata:
+                    record_metadata[record_type] = {
+                        "attributes": set(record_data.keys()),
+                        "sample_record": record_data,
+                        "has_value": "value" in record_data,
+                        "has_unit": "unit" in record_data,
+                        "has_startDate": "startDate" in record_data,
+                        "has_endDate": "endDate" in record_data,
+                    }
+                else:
+                    record_metadata[record_type]["attributes"].update(record_data.keys())
+                
+                # Defer expensive date/numeric conversions until DataFrame creation
+                # This significantly speeds up the parsing phase
+                records_by_type[record_type].append(record_data)
+                
+                # Free memory immediately after processing
+                # Just clear the element - lxml's iterparse handles tree cleanup automatically
+                # Avoid manipulating parent/child relationships as it can cause memory corruption
+                record.clear()
+        else:
+            # Fallback to standard parsing (slower but works without lxml)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Using ElementTree parser (lxml not available)", file=sys.__stderr__)
+            
+            if progress_callback:
+                progress_callback(10, "Extracting all records...")
+            
+            tree = ET.parse(export_path)
+            root = tree.getroot()
+            
+            # Count records first for progress
+            count_start_time = time.time()
+            if progress_callback:
+                progress_callback(15, "Counting records...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record counting phase...", file=sys.__stderr__)
+            
+            record_count = 0
+            count_update_interval = 200000  # Update every 200k records during counting
+            
+            for _ in root.iter("Record"):
+                record_count += 1
+                if record_count % count_update_interval == 0:
+                    elapsed = time.time() - count_start_time
+                    rate = record_count / elapsed if elapsed > 0 else 0
+                    if progress_callback:
+                        progress_callback(15, f"Counting records... ({record_count:,} found so far)")
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counted {record_count:,} records ({rate:,.0f} records/sec)", file=sys.__stderr__)
+            
+            count_elapsed = time.time() - count_start_time
+            if record_count == 0:
+                raise ValueError("No records found in export file")
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counting complete: {record_count:,} total records in {count_elapsed:.2f}s ({record_count/count_elapsed:,.0f} records/sec)", file=sys.__stderr__)
+            
+            if progress_callback:
+                progress_callback(15, f"Found {record_count:,} total records. Starting to parse...")
+            
+            parse_start_time = time.time()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record parsing phase...", file=sys.__stderr__)
+            
+            for record in root.iter("Record"):
+                record_type = record.attrib.get("type", "")
+                if not record_type:
+                    continue
+                
+                total_records += 1
+                
+                # Update progress less frequently for very large files
+                update_interval = 200000  # Always update every 200k records
+                if progress_callback and record_count:
+                    if total_records % update_interval == 0 or total_records == 1 or total_records == record_count:
+                        progress_pct = min(15 + int((total_records / record_count) * 55), 70)
+                        progress_callback(progress_pct, f"Processed {total_records:,} of {record_count:,} records...")
+                        
+                        # Terminal logging
+                        elapsed = time.time() - parse_start_time
+                        rate = total_records / elapsed if elapsed > 0 else 0
+                        pct = (total_records / record_count * 100) if record_count else 0
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsed {total_records:,}/{record_count:,} records ({pct:.1f}%) - {rate:,.0f} records/sec", file=sys.__stderr__)
+                
+                # Extract all attributes
+                record_data = dict(record.attrib)
+                records_by_type[record_type].append(record_data)
+                
+                # Track metadata for this record type
+                if record_type not in record_metadata:
+                    record_metadata[record_type] = {
+                        "attributes": set(record_data.keys()),
+                        "sample_record": record_data,
+                        "has_value": "value" in record_data,
+                        "has_unit": "unit" in record_data,
+                        "has_startDate": "startDate" in record_data,
+                        "has_endDate": "endDate" in record_data,
+                    }
+                else:
+                    record_metadata[record_type]["attributes"].update(record_data.keys())
+        
+        # Calculate parsing elapsed time (parse_start_time is set in both branches)
+        if 'parse_start_time' in locals():
+            parse_elapsed = time.time() - parse_start_time
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsing complete: {total_records:,} records in {parse_elapsed:.2f}s", file=sys.__stderr__)
+        else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsing complete: {total_records:,} records", file=sys.__stderr__)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Found {len(records_by_type)} unique record types", file=sys.__stderr__)
+        
+        # Print record type breakdown
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Record type breakdown:", file=sys.__stderr__)
+        sorted_types = sorted(records_by_type.items(), key=lambda x: len(x[1]), reverse=True)
+        for record_type, records in sorted_types[:10]:  # Top 10
+            print(f"  - {record_type}: {len(records):,} records", file=sys.__stderr__)
+        if len(sorted_types) > 10:
+            print(f"  ... and {len(sorted_types) - 10} more types", file=sys.__stderr__)
+        
+        if progress_callback:
+            progress_callback(70, f"Processed {total_records:,} total records, found {len(records_by_type)} unique types")
+        
+        # Save raw records checkpoint
+        if checkpoint_manager:
+            checkpoint_manager.save_records(dict(records_by_type))
+            checkpoint_manager.save_metadata({
+                'total_records': total_records,
+                'record_types': list(records_by_type.keys()),
+                'record_counts': {k: len(v) for k, v in records_by_type.items()}
+            })
+        
+        # Convert to DataFrames with parallel processing
+        df_start_time = time.time()
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting DataFrame conversion phase...", file=sys.__stderr__)
+        
+        if progress_callback:
+            progress_callback(75, "Converting to DataFrames...")
+        dataframes = {}
+        
+        num_types = len(records_by_type)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total record types to process: {num_types}", file=sys.__stderr__)
+        
+        # Check for existing DataFrames
+        completed_df_types = set()
+        if checkpoint_manager:
+            completed = checkpoint_manager.get_completed_dataframes()
+            completed_df_types = {rt for rt, is_daily in completed if not is_daily}
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Found {len(completed_df_types)} cached DataFrames", file=sys.__stderr__)
+        
+        # Separate records into those that need processing and those already cached
+        records_to_process = []
+        cached_records = {}
+        
+        for record_type, records in records_by_type.items():
+            if not records:
                 continue
             
-            total_records += 1
-            
-            # Update progress less frequently for very large files (every 200k records)
-            # This reduces UI overhead significantly - fewer updates = faster processing
-            update_interval = 200000  # Always update every 200k records
-            if progress_callback and record_count:
-                if total_records % update_interval == 0 or total_records == 1 or total_records == record_count:
-                    # Progress from 15% to 70% based on records processed
-                    progress_pct = min(15 + int((total_records / record_count) * 55), 70)
-                    progress_callback(progress_pct, f"Processed {total_records:,} of {record_count:,} records...")
-                    
-                    # Terminal logging
-                    elapsed = time.time() - parse_start_time
-                    rate = total_records / elapsed if elapsed > 0 else 0
-                    pct = (total_records / record_count * 100) if record_count else 0
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsed {total_records:,}/{record_count:,} records ({pct:.1f}%) - {rate:,.0f} records/sec", file=sys.__stderr__)
-            
-            # Extract all attributes (use dict() for faster conversion)
-            record_data = dict(record.attrib)
-            
-            # Track metadata for this record type
-            if record_type not in record_metadata:
-                record_metadata[record_type] = {
-                    "attributes": set(record_data.keys()),
-                    "sample_record": record_data,
-                    "has_value": "value" in record_data,
-                    "has_unit": "unit" in record_data,
-                    "has_startDate": "startDate" in record_data,
-                    "has_endDate": "endDate" in record_data,
-                }
+            if record_type in completed_df_types:
+                # Load from checkpoint
+                if checkpoint_manager:
+                    df = checkpoint_manager.load_dataframe(record_type)
+                    if df is not None:
+                        # Normalize timezone-aware date columns to avoid comparison errors
+                        for col in ['date', 'startDate', 'endDate']:
+                            if col in df.columns:
+                                try:
+                                    if df[col].dtype.name.startswith('datetime64'):
+                                        if df[col].dt.tz is not None:
+                                            df[col] = pd.to_datetime(df[col]).dt.tz_localize(None)
+                                except (AttributeError, TypeError):
+                                    pass  # Column might not be datetime64 or might be date objects
+                        cached_records[record_type] = df
+                        # Try to load daily aggregation too
+                        daily_df = checkpoint_manager.load_dataframe(record_type, is_daily=True)
+                        if daily_df is not None:
+                            # Normalize daily aggregation date column too
+                            if 'date' in daily_df.columns:
+                                try:
+                                    if daily_df['date'].dtype.name.startswith('datetime64'):
+                                        if daily_df['date'].dt.tz is not None:
+                                            daily_df['date'] = pd.to_datetime(daily_df['date']).dt.tz_localize(None)
+                                except (AttributeError, TypeError):
+                                    pass
+                            cached_records[f"{record_type}_daily"] = daily_df
             else:
-                record_metadata[record_type]["attributes"].update(record_data.keys())
+                records_to_process.append((record_type, records))
+        
+        # Process cached records first
+        dataframes.update(cached_records)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Loaded {len(cached_records)} cached DataFrames", file=sys.__stderr__)
+        
+        # Process remaining records in parallel (with fallback to sequential)
+        if records_to_process:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Need to process {len(records_to_process)} record types", file=sys.__stderr__)
             
-            # Defer expensive date/numeric conversions until DataFrame creation
-            # This significantly speeds up the parsing phase
-            records_by_type[record_type].append(record_data)
-            
-            # Free memory immediately after processing
-            record.clear()
-            # Clear siblings to free memory (iterparse keeps ancestors)
-            while record.getprevious() is not None:
-                prev = record.getprevious()
-                record.getparent().remove(prev)
-    else:
-        # Fallback to standard parsing (slower but works without lxml)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Using ElementTree parser (lxml not available)", file=sys.__stderr__)
-        
-        if progress_callback:
-            progress_callback(10, "Extracting all records...")
-        
-        tree = ET.parse(export_path)
-        root = tree.getroot()
-        
-        # Count records first for progress
-        count_start_time = time.time()
-        if progress_callback:
-            progress_callback(15, "Counting records...")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record counting phase...", file=sys.__stderr__)
-        
-        record_count = 0
-        count_update_interval = 200000  # Update every 200k records during counting
-        
-        for _ in root.iter("Record"):
-            record_count += 1
-            if record_count % count_update_interval == 0:
-                elapsed = time.time() - count_start_time
-                rate = record_count / elapsed if elapsed > 0 else 0
-                if progress_callback:
-                    progress_callback(15, f"Counting records... ({record_count:,} found so far)")
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counted {record_count:,} records ({rate:,.0f} records/sec)", file=sys.__stderr__)
-        
-        count_elapsed = time.time() - count_start_time
-        if record_count == 0:
-            raise ValueError("No records found in export file")
-        
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Counting complete: {record_count:,} total records in {count_elapsed:.2f}s ({record_count/count_elapsed:,.0f} records/sec)", file=sys.__stderr__)
-        
-        if progress_callback:
-            progress_callback(15, f"Found {record_count:,} total records. Starting to parse...")
-        
-        parse_start_time = time.time()
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting record parsing phase...", file=sys.__stderr__)
-        
-        for record in root.iter("Record"):
-            record_type = record.attrib.get("type", "")
-            if not record_type:
-                continue
-            
-            total_records += 1
-            
-            # Update progress less frequently for very large files
-            update_interval = 200000  # Always update every 200k records
-            if progress_callback and record_count:
-                if total_records % update_interval == 0 or total_records == 1 or total_records == record_count:
-                    progress_pct = min(15 + int((total_records / record_count) * 55), 70)
-                    progress_callback(progress_pct, f"Processed {total_records:,} of {record_count:,} records...")
-                    
-                    # Terminal logging
-                    elapsed = time.time() - parse_start_time
-                    rate = total_records / elapsed if elapsed > 0 else 0
-                    pct = (total_records / record_count * 100) if record_count else 0
-                    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsed {total_records:,}/{record_count:,} records ({pct:.1f}%) - {rate:,.0f} records/sec", file=sys.__stderr__)
-            
-            # Extract all attributes
-            record_data = dict(record.attrib)
-            records_by_type[record_type].append(record_data)
-        
-        # Track metadata for this record type
-        if record_type not in record_metadata:
-            record_metadata[record_type] = {
-                "attributes": set(record_data.keys()),
-                "sample_record": record_data,
-                "has_value": "value" in record_data,
-                "has_unit": "unit" in record_data,
-                "has_startDate": "startDate" in record_data,
-                "has_endDate": "endDate" in record_data,
-            }
-        else:
-            record_metadata[record_type]["attributes"].update(record_data.keys())
-    
-    # Calculate parsing elapsed time (parse_start_time is set in both branches)
-    if 'parse_start_time' in locals():
-        parse_elapsed = time.time() - parse_start_time
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsing complete: {total_records:,} records in {parse_elapsed:.2f}s", file=sys.__stderr__)
-    else:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Parsing complete: {total_records:,} records", file=sys.__stderr__)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Found {len(records_by_type)} unique record types", file=sys.__stderr__)
-    
-    # Print record type breakdown
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Record type breakdown:", file=sys.__stderr__)
-    sorted_types = sorted(records_by_type.items(), key=lambda x: len(x[1]), reverse=True)
-    for record_type, records in sorted_types[:10]:  # Top 10
-        print(f"  - {record_type}: {len(records):,} records", file=sys.__stderr__)
-    if len(sorted_types) > 10:
-        print(f"  ... and {len(sorted_types) - 10} more types", file=sys.__stderr__)
-    
-    if progress_callback:
-        progress_callback(70, f"Processed {total_records:,} total records, found {len(records_by_type)} unique types")
-    
-    # Save raw records checkpoint
-    if checkpoint_manager:
-        checkpoint_manager.save_records(dict(records_by_type))
-        checkpoint_manager.save_metadata({
-            'total_records': total_records,
-            'record_types': list(records_by_type.keys()),
-            'record_counts': {k: len(v) for k, v in records_by_type.items()}
-        })
-    
-    # Convert to DataFrames with parallel processing
-    df_start_time = time.time()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [Cache] Starting DataFrame conversion phase...", file=sys.__stderr__)
-    
-    if progress_callback:
-        progress_callback(75, "Converting to DataFrames...")
-    dataframes = {}
-    
-    num_types = len(records_by_type)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total record types to process: {num_types}", file=sys.__stderr__)
-    
-    # Check for existing DataFrames
-    completed_df_types = set()
-    if checkpoint_manager:
-        completed = checkpoint_manager.get_completed_dataframes()
-        completed_df_types = {rt for rt, is_daily in completed if not is_daily}
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Found {len(completed_df_types)} cached DataFrames", file=sys.__stderr__)
-    
-    # Separate records into those that need processing and those already cached
-    records_to_process = []
-    cached_records = {}
-    
-    for record_type, records in records_by_type.items():
-        if not records:
-            continue
-        
-        if record_type in completed_df_types:
-            # Load from checkpoint
-            if checkpoint_manager:
-                df = checkpoint_manager.load_dataframe(record_type)
-                if df is not None:
-                    # Normalize timezone-aware date columns to avoid comparison errors
-                    for col in ['date', 'startDate', 'endDate']:
-                        if col in df.columns:
-                            try:
-                                if df[col].dtype.name.startswith('datetime64'):
-                                    if df[col].dt.tz is not None:
-                                        df[col] = pd.to_datetime(df[col]).dt.tz_localize(None)
-                            except (AttributeError, TypeError):
-                                pass  # Column might not be datetime64 or might be date objects
-                    cached_records[record_type] = df
-                    # Try to load daily aggregation too
-                    daily_df = checkpoint_manager.load_dataframe(record_type, is_daily=True)
-                    if daily_df is not None:
-                        # Normalize daily aggregation date column too
-                        if 'date' in daily_df.columns:
-                            try:
-                                if daily_df['date'].dtype.name.startswith('datetime64'):
-                                    if daily_df['date'].dt.tz is not None:
-                                        daily_df['date'] = pd.to_datetime(daily_df['date']).dt.tz_localize(None)
-                            except (AttributeError, TypeError):
-                                pass
-                        cached_records[f"{record_type}_daily"] = daily_df
-        else:
-            records_to_process.append((record_type, records))
-    
-    # Process cached records first
-    dataframes.update(cached_records)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Loaded {len(cached_records)} cached DataFrames", file=sys.__stderr__)
-    
-    # Process remaining records in parallel (with fallback to sequential)
-    if records_to_process:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Need to process {len(records_to_process)} record types", file=sys.__stderr__)
-        
-        # Check if parallel processing is disabled via environment variable
-        disable_parallel = os.environ.get('DISABLE_PARALLEL_PROCESSING', 'false').lower() == 'true'
+            # Check if parallel processing is disabled via environment variable
+            disable_parallel = os.environ.get('DISABLE_PARALLEL_PROCESSING', 'false').lower() == 'true'
         
         # Determine number of workers (use CPU count, but cap at reasonable number)
         # Reduce workers to avoid memory issues - use fewer workers for safety
@@ -559,16 +581,300 @@ def parse_health_export(export_path, progress_callback=None, checkpoint_manager=
             
             sequential_elapsed = time.time() - sequential_start_time
             print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Sequential processing completed in {sequential_elapsed:.2f}s", file=sys.__stderr__)
-    
-    df_elapsed = time.time() - df_start_time
-    total_elapsed = time.time() - start_time
-    
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [Cache] DataFrame conversion completed in {df_elapsed:.2f}s", file=sys.__stderr__)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total DataFrames created: {len(dataframes)}", file=sys.__stderr__)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total processing time: {total_elapsed:.2f}s ({total_elapsed/60:.1f} minutes)", file=sys.__stderr__)
-    print(f"{'='*80}\n", file=sys.__stderr__)
-    
-    return {
+        
+        df_elapsed = time.time() - df_start_time
+        total_elapsed = time.time() - start_time
+        
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [Cache] DataFrame conversion completed in {df_elapsed:.2f}s", file=sys.__stderr__)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total DataFrames created: {len(dataframes)}", file=sys.__stderr__)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Total processing time: {total_elapsed:.2f}s ({total_elapsed/60:.1f} minutes)", file=sys.__stderr__)
+        print(f"{'='*80}\n", file=sys.__stderr__)
+        
+        # Generate and save table summaries as JSON files
+        # Save summaries in the same directory as the export (where cache will be saved)
+        if export_path:
+            # Use the directory containing the export.xml file
+            cache_dir = os.path.dirname(export_path)
+        else:
+            # If no export_path, use current directory
+            cache_dir = os.getcwd()
+        
+        table_summaries_file = Path(cache_dir) / "table_summaries.json"
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Generating table summaries...", file=sys.__stderr__)
+        
+        # Generate table summaries directly here to avoid circular import issues
+        def get_record_type_description(record_type: str) -> str:
+            """Generate a human-readable description for an Apple Health record type."""
+            # Common Apple Health record type descriptions
+            descriptions = {
+            "HKQuantityTypeIdentifierStepCount": "Daily step count - number of steps taken",
+            "HKQuantityTypeIdentifierDistanceWalkingRunning": "Distance walked or run - total distance in meters",
+            "HKQuantityTypeIdentifierFlightsClimbed": "Number of flights of stairs climbed",
+            "HKQuantityTypeIdentifierHeartRate": "Heart rate measurements - beats per minute",
+            "HKQuantityTypeIdentifierActiveEnergyBurned": "Active energy burned during exercise - calories",
+            "HKQuantityTypeIdentifierBasalEnergyBurned": "Basal metabolic rate energy - calories at rest",
+            "HKQuantityTypeIdentifierAppleExerciseTime": "Exercise time - minutes of exercise",
+            "HKQuantityTypeIdentifierBodyMass": "Body weight - mass in kg",
+            "HKQuantityTypeIdentifierHeight": "Height measurements - height in meters",
+            "HKQuantityTypeIdentifierBodyMassIndex": "Body Mass Index (BMI) - calculated from weight and height",
+            "HKQuantityTypeIdentifierBodyFatPercentage": "Body fat percentage",
+            "HKQuantityTypeIdentifierLeanBodyMass": "Lean body mass - weight excluding fat",
+            "HKQuantityTypeIdentifierRespiratoryRate": "Respiratory rate - breaths per minute",
+            "HKQuantityTypeIdentifierHeartRateVariabilitySDNN": "Heart rate variability - standard deviation",
+            "HKQuantityTypeIdentifierDietaryWater": "Water intake - volume in liters",
+            "HKQuantityTypeIdentifierDietaryEnergyConsumed": "Dietary calories consumed",
+            "HKQuantityTypeIdentifierDietaryFatTotal": "Total dietary fat consumed - grams",
+            "HKQuantityTypeIdentifierDietaryFatSaturated": "Saturated fat consumed - grams",
+            "HKQuantityTypeIdentifierDietaryCholesterol": "Cholesterol consumed - milligrams",
+            "HKQuantityTypeIdentifierDietarySodium": "Sodium consumed - milligrams",
+            "HKQuantityTypeIdentifierDietaryCarbohydrates": "Carbohydrates consumed - grams",
+            "HKQuantityTypeIdentifierDietaryFiber": "Dietary fiber consumed - grams",
+            "HKQuantityTypeIdentifierDietarySugar": "Sugar consumed - grams",
+            "HKCategoryTypeIdentifierSleepAnalysis": "Sleep analysis - sleep stages (asleep, awake, in bed)",
+            "HKCategoryTypeIdentifierAppleStandHour": "Stand hours - whether user stood for at least 1 minute in the hour",
+            }
+            
+            if record_type in descriptions:
+                return descriptions[record_type]
+            
+            # Generate description from identifier name
+            if "HKQuantityTypeIdentifier" in record_type:
+                name = record_type.replace("HKQuantityTypeIdentifier", "")
+                readable = ''.join([' ' + c if c.isupper() else c for c in name]).strip()
+                return f"Quantity measurement: {readable.lower()}"
+            elif "HKCategoryTypeIdentifier" in record_type:
+                name = record_type.replace("HKCategoryTypeIdentifier", "")
+                readable = ''.join([' ' + c if c.isupper() else c for c in name]).strip()
+                return f"Category data: {readable.lower()}"
+            elif "HKWorkoutTypeIdentifier" in record_type:
+                return "Workout data - exercise sessions with duration, energy burned, and distance"
+            else:
+                return f"Health data: {record_type}"
+        
+        def generate_table_summary_local(record_type: str, df, metadata: Dict[str, Any] = None) -> Dict[str, Any]:
+            """Generate a comprehensive summary for a single table."""
+            # Get column types
+            column_types = {}
+            for col in df.columns:
+                try:
+                    dtype_str = str(df[col].dtype)
+                    # Convert pandas dtypes to more readable format
+                    if 'int' in dtype_str:
+                        column_types[col] = "integer"
+                    elif 'float' in dtype_str:
+                        column_types[col] = "float"
+                    elif 'datetime' in dtype_str or 'date' in dtype_str:
+                        column_types[col] = "datetime" if 'datetime' in dtype_str else "date"
+                    elif 'object' in dtype_str:
+                        column_types[col] = "string"
+                    elif 'bool' in dtype_str:
+                        column_types[col] = "boolean"
+                    else:
+                        column_types[col] = dtype_str
+                except:
+                    column_types[col] = "unknown"
+            
+            # Get example rows (2-3 samples)
+            example_rows = []
+            try:
+                if len(df) > 0:
+                    # Sample up to 3 rows, avoiding duplicates
+                    sample_size = min(3, len(df))
+                    if len(df) <= 3:
+                        sample_df = df.head(sample_size)
+                    else:
+                        # Sample from different parts of the dataframe
+                        indices = [0]
+                        if len(df) > 1:
+                            indices.append(len(df) // 2)
+                        if len(df) > 2:
+                            indices.append(len(df) - 1)
+                        sample_df = df.iloc[indices[:sample_size]]
+                    
+                    # Convert to dict format for JSON serialization
+                    for idx, row in sample_df.iterrows():
+                        row_dict = {}
+                        for col in df.columns:
+                            val = row[col]
+                            # Convert non-serializable types to strings
+                            if pd.isna(val):
+                                row_dict[col] = None
+                            elif isinstance(val, (pd.Timestamp, datetime)):
+                                row_dict[col] = str(val)
+                            elif isinstance(val, date) and not isinstance(val, datetime):
+                                row_dict[col] = str(val)
+                            else:
+                                try:
+                                    # Try to keep as native type if JSON serializable
+                                    json.dumps(val)
+                                    row_dict[col] = val
+                                except:
+                                    row_dict[col] = str(val)
+                        example_rows.append(row_dict)
+            except Exception as e:
+                print(f"[Cache] Warning: Could not extract example rows for {record_type}: {e}", file=sys.__stderr__)
+                example_rows = []
+            
+            summary = {
+                "record_type": record_type,
+                "record_count": len(df),
+                "columns": df.columns.tolist(),
+                "column_types": column_types,
+                "column_count": len(df.columns),
+                "description": get_record_type_description(record_type),
+                "example_rows": example_rows,
+            }
+            
+            # Date information - use safer operations for large dataframes
+            if 'date' in df.columns and len(df) > 0:
+                try:
+                    # For very large dataframes, use more efficient operations to avoid segfaults
+                    if len(df) > 1000000:
+                        # Use nsmallest/nlargest which is more memory efficient than sorting entire column
+                        date_col = df['date'].dropna()
+                        if len(date_col) > 0:
+                            try:
+                                date_min = date_col.nsmallest(1).iloc[0]
+                                date_max = date_col.nlargest(1).iloc[0]
+                            except:
+                                # Fallback: sample and find min/max
+                                sample_size = min(100000, len(date_col))
+                                date_sample = date_col.sample(n=sample_size, random_state=42)
+                                date_min = date_sample.min()
+                                date_max = date_sample.max()
+                        else:
+                            date_min = None
+                            date_max = None
+                    else:
+                        date_min = df['date'].min()
+                        date_max = df['date'].max()
+                    
+                    if date_min is not None and date_max is not None:
+                        summary["date_range"] = {
+                            "min": str(date_min),
+                            "max": str(date_max),
+                            "has_dates": True
+                        }
+                    else:
+                        summary["date_range"] = {"has_dates": False}
+                except Exception as e:
+                    print(f"[Cache] Warning: Could not extract date range for {record_type}: {e}", file=sys.__stderr__)
+                    summary["date_range"] = {"has_dates": False}
+            else:
+                summary["date_range"] = {"has_dates": False}
+            
+            # Value information - use safer operations for large dataframes
+            if 'value_numeric' in df.columns:
+                try:
+                    value_col = df['value_numeric']
+                    non_null = value_col.notna().sum()
+                    if non_null > 0:
+                        # For very large dataframes, use more memory-efficient operations
+                        if len(df) > 1000000:
+                            # Sample for statistics to avoid segfaults
+                            value_sample = value_col.dropna()
+                            if len(value_sample) > 100000:
+                                value_sample = value_sample.sample(n=100000, random_state=42)
+                            
+                            summary["value_numeric"] = {
+                                "has_values": True,
+                                "non_null_count": int(non_null),
+                                "min": float(value_sample.min()),
+                                "max": float(value_sample.max()),
+                                "mean": float(value_sample.mean()),
+                                "median": float(value_sample.median())
+                            }
+                        else:
+                            summary["value_numeric"] = {
+                                "has_values": True,
+                                "non_null_count": int(non_null),
+                                "min": float(value_col.min()),
+                                "max": float(value_col.max()),
+                                "mean": float(value_col.mean()),
+                                "median": float(value_col.median())
+                            }
+                    else:
+                        summary["value_numeric"] = {"has_values": False}
+                except Exception as e:
+                    print(f"[Cache] Warning: Could not extract value statistics for {record_type}: {e}", file=sys.__stderr__)
+                    summary["value_numeric"] = {"has_values": False}
+            else:
+                summary["value_numeric"] = {"has_values": False}
+            
+            if 'value' in df.columns:
+                summary["has_value_field"] = True
+            else:
+                summary["has_value_field"] = False
+            
+            # Units
+            if 'unit' in df.columns:
+                try:
+                    unique_units = df['unit'].dropna().unique().tolist()[:10]
+                    summary["units"] = [str(u) for u in unique_units]
+                    summary["unit_count"] = len(unique_units)
+                except:
+                    summary["units"] = []
+                    summary["unit_count"] = 0
+            else:
+                summary["units"] = []
+                summary["unit_count"] = 0
+            
+            # Add metadata if available
+            if metadata:
+                summary["metadata"] = {
+                    "has_value": metadata.get("has_value", False),
+                    "has_unit": metadata.get("has_unit", False),
+                    "has_startDate": metadata.get("has_startDate", False),
+                    "has_endDate": metadata.get("has_endDate", False),
+                    "attributes": metadata.get("attributes", [])
+                }
+            
+            return summary
+        
+        table_summaries = {}
+        total_tables = len([rt for rt in dataframes.keys() if "_daily" not in rt])
+        processed_tables = 0
+        
+        for record_type, df in dataframes.items():
+            if "_daily" in record_type:
+                continue  # Skip daily aggregations in summaries
+            
+            processed_tables += 1
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Generating summary for {record_type} ({processed_tables}/{total_tables}) - {len(df):,} records", file=sys.__stderr__)
+            
+            try:
+                metadata_for_type = record_metadata.get(record_type, {})
+                summary = generate_table_summary_local(record_type, df, metadata_for_type)
+                table_summaries[record_type] = summary
+            except Exception as e:
+                import traceback
+                print(f"[Cache] ERROR: Failed to generate summary for {record_type}: {e}", file=sys.__stderr__)
+                print(f"[Cache] Traceback: {traceback.format_exc()}", file=sys.__stderr__)
+                # Create a minimal summary so we don't lose the table entirely
+                table_summaries[record_type] = {
+                    "record_type": record_type,
+                    "record_count": len(df),
+                    "columns": df.columns.tolist() if hasattr(df, 'columns') else [],
+                    "column_count": len(df.columns) if hasattr(df, 'columns') else 0,
+                    "description": get_record_type_description(record_type),
+                    "error": str(e)
+                }
+        
+        # Save all table summaries to a single JSON file
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Saving {len(table_summaries)} table summaries to {table_summaries_file}...", file=sys.__stderr__)
+        try:
+            with open(table_summaries_file, 'w') as f:
+                json.dump(table_summaries, f, indent=2, default=str)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] ✓ Saved table summaries successfully", file=sys.__stderr__)
+        except Exception as e:
+            print(f"[Cache] ERROR: Could not save table summaries: {e}", file=sys.__stderr__)
+            import traceback
+            print(f"[Cache] Traceback: {traceback.format_exc()}", file=sys.__stderr__)
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] [Cache] Generated {len(table_summaries)} table summaries", file=sys.__stderr__)
+        
+        return {
         "raw_records": dataframes,
         "metadata": {k: {
             "attributes": list(v["attributes"]),
@@ -579,9 +885,14 @@ def parse_health_export(export_path, progress_callback=None, checkpoint_manager=
             "has_endDate": v["has_endDate"],
         } for k, v in record_metadata.items()},
         "record_counts": {k: len(v) for k, v in records_by_type.items()},
+        "table_summaries": table_summaries,
+        "table_summaries_file": str(table_summaries_file),
         "cache_date": datetime.now(),
         "total_records": total_records,
     }
+    finally:
+        # Always release the lock when done
+        file_lock.release()
 
 
 def load_all_health_data(export_path, cache_path, force_reload=False, progress_callback=None, checkpoint_manager=None):
@@ -622,6 +933,23 @@ def load_all_health_data(export_path, cache_path, force_reload=False, progress_c
     
     # Parse from XML (with checkpoint support)
     data = parse_health_export(export_path, progress_callback=progress_callback, checkpoint_manager=checkpoint_manager)
+    
+    # If another process handled parsing, try to load from cache
+    if data is None:
+        if not force_reload and os.path.exists(cache_path):
+            cache_time = os.path.getmtime(cache_path)
+            if os.path.exists(export_path):
+                export_time = os.path.getmtime(export_path)
+                if cache_time > export_time:
+                    if progress_callback:
+                        progress_callback(50, "Loading health data from cache (created by another process)...")
+                    with open(cache_path, 'rb') as f:
+                        data = pickle.load(f)
+                    if progress_callback:
+                        progress_callback(100, f"✅ Loaded cached data with {len(data['raw_records'])} record types")
+                    return data
+        # If we can't load from cache, raise an error
+        raise RuntimeError("Another process is parsing this file. Please wait and try again.")
     
     # Save to cache
     if progress_callback:
